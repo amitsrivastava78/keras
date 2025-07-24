@@ -29,6 +29,7 @@ class GPTQConfig:
     def __init__(
         self,
         dataset,
+        tokenizer: str,
         wbits: int = 4,
         nsamples: int = 128,
         seqlen: int = 512,
@@ -38,6 +39,7 @@ class GPTQConfig:
         act_order: bool = False,
     ):
         self.dataset = dataset
+        self.tokenizer = tokenizer
         self.nsamples = nsamples
         self.seqlen = seqlen
         self.percdamp = percdamp
@@ -45,33 +47,14 @@ class GPTQConfig:
         self.groupsize = groupsize
         self.symmetric = symmetric
         self.act_order = act_order
-        self.quantization_method = "gptq"  # Fixed identifier for the method
+        self.quantization_method = "gptq"
 
     def quantize(self, model):
         """
-        Applies the GPTQ quantization to the provided model using this configuration.
-
-        This method is a wrapper around the main `quantize_model` function from the
-        gptqutils module.
-
-        Args:
-            model (keras.Model): The pre-trained Keras model to be quantized.
-
-        Returns:
-            The result of the quantization process. Note: The underlying function
-            may modify the model in-place.
+        Applies GPTQ quantization to the provided model using this configuration.
         """
         print("Initiating quantization from GPTQConfig...")
-        return quantize_model(
-            model=model,
-            dataset=self.dataset,
-            nsamples=self.nsamples,
-            seqlen=self.seqlen,
-            percdamp=self.percdamp,
-            groupsize=self.groupsize,
-            symmetric=self.symmetric,
-            act_order=self.act_order,
-            wbits=self.wbits
-        )
-        # Return the model, which has been modified in-place.
-        return model
+        # The core logic is now delegated to gptqutils, which will handle
+        # the dynamic imports and data loading.
+        return quantize_model(model=model, config=self)
+        

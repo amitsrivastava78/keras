@@ -10,9 +10,11 @@ from absl.testing import parameterized
 from keras.src import backend
 from keras.src import layers
 from keras.src import losses
+from keras.src import models
 from keras.src import testing
 from keras.src import tree
 from keras.src.layers.core.input_layer import Input
+
 from keras.src.models.functional import Functional
 from keras.src.models.model import Model
 from keras.src.models.model import model_from_json
@@ -837,17 +839,23 @@ class ModelTest(testing.TestCase):
             model.quantize("int7")
     
     def test_quantize_gptq_integration(self):
-        """Tests that `model.quantize` correctly dispatches to the GPTQ backend."""
-        # 1. Create a simple model to be quantized.
-        model = Model(
-            inputs=layers.Input(shape=(10,)),
-            outputs=layers.Dense(1, name="output"),
-        )
-        model.build(input_shape=(None, 10))
-        self.assertTrue(model.built)
+        """
+        Tests that `model.quantize('gptq', ...)` correctly calls the backend.
+        """
+        # 1. Create a simple, built model to run the test on.
+        model = models.Sequential([
+            layers.Input(shape=(10,)),
+            layers.Dense(1, name="dense_layer")
+        ])
+        model.build()
 
-        # 2. Create the GPTQ configuration object.
-        gptq_config = GPTQConfig(dataset="wikitext2", nsamples=128)
+        # 2. Create an instance of the configuration object.
+        # The parameters here are for demonstrating the API.
+        gptq_config = GPTQConfig(
+            dataset="wikitext2",
+            tokenizer="facebook/opt-125m",
+            wbits=4,
+        )
 
         # 3. Mock the internal call to the config's quantize method.
         # This allows us to verify the integration without running the full
@@ -857,24 +865,25 @@ class ModelTest(testing.TestCase):
             gptq_config, "quantize", autospec=True
         ) as mock_quantize_method:
             # Set the mock to return a new dummy model to simulate success.
-            quantized_model_mock = Model(
-                inputs=layers.Input(shape=(10,)),
-                outputs=layers.Dense(1, name="quantized_output"),
-            )
+            quantized_model_mock = models.Sequential([layers.Dense(1)])
             mock_quantize_method.return_value = quantized_model_mock
 
-            # 4. Call the top-level API.
-            quantized_model = model.quantize(
+            # 4. Call the model's top-level quantize method.
+            print("Inside model test gptq")
+            returned_model = model.quantize(
                 "gptq",
                 gptq_config=gptq_config,
             )
 
-            # 5. Assert that our backend method was called correctly with the model.
-            mock_quantize_method.assert_called_once_with(model)
+            # 5. Assert that our backend method was called exactly once.
+            mock_quantize_method.assert_called_once()
 
-            # 6. Assert that the returned model is the one from our backend.
-            self.assertIs(quantized_model, quantized_model_mock)
-            self.assertIsNot(quantized_model, model)
+            # 6. Assert that the correct model instance was passed to our backend.
+            # The model is passed as the first positional argument.
+            self.assertIs(mock_quantize_method.call_args[0][0], model)
+
+            # 7. Assert that the returned model is the one from our mock.
+            self.assertIs(returned_model, quantized_model_mock)
 
     @parameterized.named_parameters(
         ("int8", "int8"),

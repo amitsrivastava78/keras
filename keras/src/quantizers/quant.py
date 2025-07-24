@@ -1,5 +1,5 @@
-import keras
 import keras.ops as ops
+
 
 def quantize(x, scale, zero, maxq):
     """The core quantization function."""

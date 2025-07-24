@@ -1,14 +1,16 @@
 import random
+import time
+
 import numpy as np
-import argparse
+from datasets import load_dataset
+from .gptq import GPTQ
+from .quant import Quantizer
+from tqdm import tqdm
+
+
 import keras
 import keras.ops as ops
-from transformers import AutoTokenizer
-from datasets import load_dataset
-from gptq import GPTQ
-from quant import Quantizer
-import time
-from tqdm import tqdm
+
 
 def eval_keras(model, dataloader, seqlen):
     """Evaluation loop for Perplexity."""
@@ -165,17 +167,18 @@ def sequential_keras(model, dataloader, nsamples, seqlen, percdamp, groupsize, s
     return {}
 
 
-def quantize_model(model, dataset, nsamples, seqlen, percdamp, groupsize, symmetric, act_order, wbits):
+def quantize_model(model, config):
     
-
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-
-    dataloader = get_dataloader(tokenizer, seqlen, dataset, nsamples)
+    print("Inside the gotqutils.py file")
+    dataloader = get_dataloader(config.tokenizer, config.seqlen, config.dataset, config.nsamples)
 
     tick = time.time()
-    sequential_keras(model, dataloader, nsamples, seqlen, percdamp, groupsize, symmetric, act_order, wbits)
+    sequential_keras(model, dataloader, config.nsamples, config.seqlen, config.percdamp, 
+                        config.groupsize, config.symmetric, config.act_order, config.wbits)
     print(f"Total quantization time: {time.time() - tick:.2f} seconds")
 
     print("\nLoading test data for evaluation...")
-    test_dataloader = get_dataloader(tokenizer, seqlen, dataset, nsamples=50) 
-    eval_keras(model, test_dataloader, seqlen)
+    test_dataloader = get_dataloader(config.tokenizer, config.seqlen, config.dataset, nsamples=50) 
+    eval_keras(model, test_dataloader, config.seqlen)
+    # Return the model after it has been modified in-place.
+    return model

@@ -1,10 +1,9 @@
+import math
+
+from .quant import quantize
+
 import keras
 import keras.ops as ops
-import time
-import math
-import copy
-
-from quant import quantize
 
 # The _set_diag helper function has been removed.
 

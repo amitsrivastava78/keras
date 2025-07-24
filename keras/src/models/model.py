@@ -433,6 +433,30 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         """
         from keras.src.dtype_policies import QUANTIZATION_MODES
 
+        if mode == "gptq":
+            try:
+                print("Inside the model.py before the GPTQ import")
+                from keras.src.quantizers.gptqconfig import GPTQConfig
+            except ImportError:
+                raise ImportError(
+                    "To use 'gptq' mode, please ensure the necessary "
+                    "quantization modules are correctly placed in keras/src/quantizers."
+                )
+
+            config = kwargs.get("gptq_config")
+            print("Inside the model.py before the instance check")
+            if not isinstance(config, GPTQConfig):
+                raise TypeError(
+                    "When using 'gptq' mode, you must pass a `gptq_config` "
+                    "keyword argument of type `keras.quantizers.GPTQConfig`."
+                )
+
+            # The config object's own quantize method drives the process.
+            print("Just before the quantize call")
+            quantized_model = config.quantize(self)
+            print(f"DEBUG: Value returned from config.quantize: {quantized_model}")
+            return quantized_model
+
         type_check = kwargs.pop("type_check", True)
         if kwargs:
             raise ValueError(
@@ -444,26 +468,6 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 "Invalid quantization mode. "
                 f"Expected one of {QUANTIZATION_MODES}. Received: mode={mode}"
             )
-        if mode == "gptq":
-            try:
-                from keras.src.quantizers.gptqconfig import GPTQConfig
-            except ImportError:
-                raise ImportError(
-                    "To use 'gptq' mode, please ensure the necessary "
-                    "quantization modules are correctly placed in keras/src/quantizers."
-                )
-
-            config = kwargs.get("gptq_config")
-
-            if not isinstance(config, GPTQConfig):
-                raise TypeError(
-                    "When using 'gptq' mode, you must pass a `gptq_config` "
-                    "keyword argument of type `keras.quantizers.GPTQConfig`."
-                )
-
-            # The config object's own quantize method drives the process.
-            return config.quantize(self)
-
         mode_changed = False
         for layer in self._flatten_layers():
             list_of_sublayers = list(layer._flatten_layers())
