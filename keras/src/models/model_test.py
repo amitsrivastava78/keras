@@ -839,30 +839,31 @@ class ModelTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid quantization mode"):
             model.quantize("int7")
     
+    @pytest.mark.slow
     def test_quantize_gptq_integration(self):
         """
         Tests that `model.quantize('gptq', ...)` correctly calls the backend.
         """
-        model_id = "facebook/opt-125m"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        # Use the TF-specific class to get a TensorFlow/Keras-based model
-        model = TFAutoModelForCausalLM.from_pretrained(model_id)
+    model_id = "facebook/opt-125m"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Use the TF-specific class to get a TensorFlow/Keras-based model
+    model = TFAutoModelForCausalLM.from_pretrained(model_id)
 
-        # Store the original weights of a specific layer for later comparison.
-        original_weights = np.copy(model.model.decoder.layers[0].self_attn.q_proj.kernel.numpy())
+    # Store the original weights of a specific layer for later comparison.
+    original_weights = np.copy(model.model.decoder.layers[0].self_attn.q_proj.kernel.numpy())
 
-        # 2. Create the GPTQ configuration.
-        gptq_config = GPTQConfig(
-            dataset="wikitext2",
-            tokenizer=tokenizer,
-            wbits=4,
-            nsamples=8,  # Use a very small number of samples for the test
-            seqlen=128,  # Use a short sequence length
-        )
+    # 2. Create the GPTQ configuration.
+    gptq_config = GPTQConfig(
+        dataset="wikitext2",
+        tokenizer=tokenizer,
+        wbits=4,
+        nsamples=8,  # Use a very small number of samples for the test
+        seqlen=128,  # Use a short sequence length
+    )
 
-        # 3. Run the actual quantization process by calling the config object directly.
-        # This is the correct way to apply the logic to a third-party model object.
-        quantized_model = gptq_config.quantize(model)
+    # 3. Run the actual quantization process by calling the config object directly.
+    # This is the correct way to apply the logic to a third-party model object.
+    quantized_model = gptq_config.quantize(model)
 
 
 
