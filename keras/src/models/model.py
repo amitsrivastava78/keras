@@ -444,6 +444,26 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 "Invalid quantization mode. "
                 f"Expected one of {QUANTIZATION_MODES}. Received: mode={mode}"
             )
+        if mode == "gptq":
+            try:
+                from keras.src.quantizers.gptqconfig import GPTQConfig
+            except ImportError:
+                raise ImportError(
+                    "To use 'gptq' mode, please ensure the necessary "
+                    "quantization modules are correctly placed in keras/src/quantizers."
+                )
+
+            config = kwargs.get("gptq_config")
+
+            if not isinstance(config, GPTQConfig):
+                raise TypeError(
+                    "When using 'gptq' mode, you must pass a `gptq_config` "
+                    "keyword argument of type `keras.quantizers.GPTQConfig`."
+                )
+
+            # The config object's own quantize method drives the process.
+            return config.quantize(self)
+
         mode_changed = False
         for layer in self._flatten_layers():
             list_of_sublayers = list(layer._flatten_layers())
@@ -906,3 +926,76 @@ def inject_functional_model_class(cls):
     cls.__new__(cls)
 
     return cls
+
+class ModelTest(testing.TestCase):
+    def test_model_creation(self):
+        # Subclass
+        class MyModel(Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.dense1 = layers.Dense(1, name="dense1")
+                self.dense2 = layers.Dense(1, name="dense2")
+
+            def call(self, x):
+                return self.dense2(self.dense1(x))
+
+        model = MyModel(name="subclass_model")
+        self.assertEqual(model.name, "subclass_model")
+        self.assertIsInstance(model, Model)
+
+        # Functional
+        inputs = layers.Input((3,))
+        outputs = layers.Dense(1)(inputs)
+        model = Model(inputs, outputs, name="functional_model")
+        self.assertEqual(model.name, "functional_model")
+        self.assertIsInstance(model, Model)
+
+    def test_model_build(self):
+        inputs = layers.Input((3,))
+        outputs = layers.Dense(1)(inputs)
+        model = Model(inputs, outputs)
+        self.assertFalse(model.built)
+        model.build(input_shape=(None, 3))
+        self.assertTrue(model.built)
+
+    def test_quantize_gptq_integration(self):
+        """Tests that `model.quantize` correctly dispatches to the GPTQ backend."""
+        # 1. Create a simple model to be quantized.
+        model = models.Sequential(
+            [
+                layers.Input(shape=(10,)),
+                layers.Dense(20, activation="relu"),
+                layers.Dense(1, activation="sigmoid"),
+            ]
+        )
+        model.build(input_shape=(None, 10))
+        self.assertTrue(model.built)
+
+        # 2. Create the GPTQ configuration object. The user only needs to
+        # provide the dataset name, and the backend handles loading it.
+        gptq_config = GPTQConfig(dataset="wikitext2", nsamples=128)
+
+        # 3. Mock the internal call to the config's quantize method.
+        # This allows us to verify the integration without running the full
+        # (and slow) quantization algorithm. We just want to test that the
+        # `model.quantize` method correctly calls our backend.
+        with mock.patch.object(
+            gptq_config, "quantize", autospec=True
+        ) as mock_quantize_method:
+            # Set the mock to return a new dummy model to simulate success.
+            quantized_model_mock = models.Sequential([layers.Dense(1)])
+            mock_quantize_method.return_value = quantized_model_mock
+
+            # 4. Call the top-level API. Note that calibration_data is not needed
+            # as it's handled internally based on the config's dataset name.
+            quantized_model = model.quantize(
+                "gptq",
+                gptq_config=gptq_config,
+            )
+
+            # 5. Assert that our backend method was called correctly with the model.
+            mock_quantize_method.assert_called_once_with(model)
+
+            # 6. Assert that the returned model is the one from our backend.
+            self.assertIs(quantized_model, quantized_model_mock)
+            self.assertIsNot(quantized_model, model)

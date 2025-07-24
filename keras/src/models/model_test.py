@@ -1,6 +1,7 @@
 import os
 import pickle
 from collections import namedtuple
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from keras.src.layers.core.input_layer import Input
 from keras.src.models.functional import Functional
 from keras.src.models.model import Model
 from keras.src.models.model import model_from_json
+from keras.src.quantizers.gptqconfig import GPTQConfig
 
 
 def _get_model():
@@ -833,6 +835,46 @@ class ModelTest(testing.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Invalid quantization mode"):
             model.quantize("int7")
+    
+    def test_quantize_gptq_integration(self):
+        """Tests that `model.quantize` correctly dispatches to the GPTQ backend."""
+        # 1. Create a simple model to be quantized.
+        model = Model(
+            inputs=layers.Input(shape=(10,)),
+            outputs=layers.Dense(1, name="output"),
+        )
+        model.build(input_shape=(None, 10))
+        self.assertTrue(model.built)
+
+        # 2. Create the GPTQ configuration object.
+        gptq_config = GPTQConfig(dataset="wikitext2", nsamples=128)
+
+        # 3. Mock the internal call to the config's quantize method.
+        # This allows us to verify the integration without running the full
+        # (and slow) quantization algorithm. We just want to test that the
+        # `model.quantize` method correctly calls our backend.
+        with mock.patch.object(
+            gptq_config, "quantize", autospec=True
+        ) as mock_quantize_method:
+            # Set the mock to return a new dummy model to simulate success.
+            quantized_model_mock = Model(
+                inputs=layers.Input(shape=(10,)),
+                outputs=layers.Dense(1, name="quantized_output"),
+            )
+            mock_quantize_method.return_value = quantized_model_mock
+
+            # 4. Call the top-level API.
+            quantized_model = model.quantize(
+                "gptq",
+                gptq_config=gptq_config,
+            )
+
+            # 5. Assert that our backend method was called correctly with the model.
+            mock_quantize_method.assert_called_once_with(model)
+
+            # 6. Assert that the returned model is the one from our backend.
+            self.assertIs(quantized_model, quantized_model_mock)
+            self.assertIsNot(quantized_model, model)
 
     @parameterized.named_parameters(
         ("int8", "int8"),
