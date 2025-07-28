@@ -2,6 +2,7 @@ import os
 import pickle
 from collections import namedtuple
 from unittest import mock
+import keras_nlp
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from keras.src.models.model import Model
 from keras.src.models.model import model_from_json
 from keras.src.quantizers.gptqconfig import GPTQConfig
 from transformers import AutoTokenizer, TFAutoModelForCausalLM
+
 
 
 def _get_model():
@@ -844,26 +846,54 @@ class ModelTest(testing.TestCase):
         """
         Tests that `model.quantize('gptq', ...)` correctly calls the backend.
         """
-    model_id = "facebook/opt-125m"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Use the TF-specific class to get a TensorFlow/Keras-based model
-    model = TFAutoModelForCausalLM.from_pretrained(model_id)
+        # model_id = "facebook/opt-125m"
+        # tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # # Use the TF-specific class to get a TensorFlow/Keras-based model
+        # model = TFAutoModelForCausalLM.from_pretrained(model_id)
 
-    # Store the original weights of a specific layer for later comparison.
-    original_weights = np.copy(model.model.decoder.layers[0].self_attn.q_proj.kernel.numpy())
+        model = keras_nlp.models.OPTCausalLM.from_preset("opt_125m_en")
 
-    # 2. Create the GPTQ configuration.
-    gptq_config = GPTQConfig(
-        dataset="wikitext2",
-        tokenizer=tokenizer,
-        wbits=4,
-        nsamples=8,  # Use a very small number of samples for the test
-        seqlen=128,  # Use a short sequence length
-    )
+        # --- CORRECTED PART ---
+        # To access the transformer layers, we must first get the 'backbone' model.
+        backbone = model.get_layer("opt_backbone_1")
 
-    # 3. Run the actual quantization process by calling the config object directly.
-    # This is the correct way to apply the logic to a third-party model object.
-    quantized_model = gptq_config.quantize(model)
+        # Now we can get the specific transformer layer and its weights from the backbone.
+        original_weights = np.copy(
+            backbone.get_layer("transformer_layer_0")
+            ._self_attention_layer._query_dense.kernel.numpy()
+        )
+
+        # 2. Create the GPTQ configuration.
+        gptq_config = GPTQConfig(
+            dataset="wikitext2",
+            # 
+            tokenizer=model.preprocessor.tokenizer,
+            wbits=4,
+            nsamples=8,  # Use a very small number of samples for the test
+            seqlen=128,  # Use a short sequence length
+        )
+
+        # 3. Run the actual quantization process by calling the config object directly.
+        # This is the correct way to apply the logic to a third-party model object.
+        quantized_model = gptq_config.quantize(model)
+
+        # assert isinstance(
+        #     quantized_model, tf.keras.Model
+        # ), "The quantization process should return a valid Keras Model."
+
+        quantized_weights = quantized_model.model.decoder.layers[
+        0
+        ].self_attn.q_proj.kernel.numpy()
+        assert not np.allclose(
+            original_weights, quantized_weights
+        ), "The weights of the model were not changed by the quantization process."
+    
+        # dummy_input = tokenizer("Hello, world!", return_tensors="np")["input_ids"]
+        dummy_input = "Hello, world!"
+        try:
+            _ = quantized_model.predict(dummy_input)
+        except Exception as e:
+            pytest.fail(f"The quantized model failed during predict(): {e}")
 
 
 
