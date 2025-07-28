@@ -188,35 +188,33 @@ def sequential_keras(
                 # Reshape the input tensor correctly for each layer type.
                 if name == "self_attn.out_proj":
                     # The input to out_proj is 4D: (batch, seq_len, num_heads, head_dim)
-                    # We need to reshape it to (batch * seq_len, num_heads * head_dim) to match the kernel.
-                    in_shape = ops.shape(inp) # e.g., (1, 128, 12, 64)
+                    # We reshape it to (batch * seq_len, num_heads * head_dim) to match the kernel.
+                    in_shape = ops.shape(inp)
                     inp_reshaped = ops.reshape(inp, (in_shape[0] * in_shape[1], in_shape[2] * in_shape[3]))
                 else:
-                    # All other layers have 3D input: (batch, seq_len, features)
-                    # We reshape to (batch * seq_len, features)
+                    # All other layers have 3D input which we reshape to 2D
                     inp_reshaped = ops.reshape(inp, (-1, ops.shape(inp)[-1]))
 
                 gptq_objects[name].add_batch(inp_reshaped)
-
 
         for name, gptq_object in gptq_objects.items():
             print(f"  Quantizing {name}...")
             gptq_object.fasterquant(percdamp=percdamp, groupsize=groupsize, actorder=act_order)
             gptq_object.free()
 
-            if i < len(layers) - 1:
-                print(f"Generating inputs for block {i + 1}...")
-                next_block_inputs = []
-                for j in range(nsamples):
-                    # --- DEFENSIVE SHAPE CORRECTION ---
-                    # Force the input to be 3D before passing it to the quantized layer.
-                    current_input = inputs[j]
-                    if len(current_input.shape) == 2:
-                        current_input = ops.expand_dims(current_input, axis=0)
-                    
-                    output = layer(current_input)[0]
-                    next_block_inputs.append(output)
-                inputs = next_block_inputs
+        if i < len(layers) - 1:
+            print(f"Generating inputs for block {i + 1}...")
+            next_block_inputs = []
+            for j in range(nsamples):
+                # --- DEFENSIVE SHAPE CORRECTION ---
+                # Force the input to be 3D before passing it to the quantized layer.
+                current_input = inputs[j]
+                if len(current_input.shape) == 2:
+                    current_input = ops.expand_dims(current_input, axis=0)
+                
+                output = layer(current_input)[0]
+                next_block_inputs.append(output)
+            inputs = next_block_inputs
         
         del gptq_objects, temp_model
         if 'next_block_inputs' in locals():

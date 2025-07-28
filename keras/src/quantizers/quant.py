@@ -2,7 +2,15 @@ import keras.ops as ops
 
 
 def quantize(x, scale, zero, maxq):
-    """The core quantization function."""
+    """The core quantization function with correct broadcasting."""
+    # Ensure scale is broadcastable with the input tensor x
+    if scale.shape != x.shape:
+        scale = ops.broadcast_to(scale, x.shape)
+    
+    # Ensure zero-point is also broadcastable
+    if zero.shape != x.shape:
+        zero = ops.broadcast_to(zero, x.shape)
+    
     scale = ops.where(ops.equal(scale, 0), 1e-8, scale)
     q = ops.round(x / scale) + zero
     q = ops.clip(q, 0, maxq)

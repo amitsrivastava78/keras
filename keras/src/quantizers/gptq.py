@@ -6,94 +6,71 @@ from keras.layers import Dense, EinsumDense
 from .quant import quantize
 
 
+# In gptq.py
+
 class GPTQ:
     def __init__(self, layer):
         self.original_layer = layer
-        self.dev = "cpu"
+        self.layer = layer 
+        
+        # --- THIS IS THE FIX ---
+        # Store the original kernel shape for the final reshape operation.
         self.kernel_shape = layer.kernel.shape
+        
+        W = ops.cast(layer.kernel, 'float32')
+        self.rows = W.shape[0]
+        self.columns = W.shape[1]
+        
+        self.H = ops.zeros((self.rows, self.rows), dtype="float32")
         self.nsamples = 0
-
-        # --- NEW, MORE ROBUST INITIALIZATION LOGIC ---
-        if isinstance(layer, Dense):
-            self.rows, self.columns = self.kernel_shape
-            self.layer = layer
-
-        elif isinstance(layer, EinsumDense):
-            # For OPT-like models, attention layers use EinsumDense with a 3D kernel.
+        self.quantizer = None
+        
+        if isinstance(layer, EinsumDense):
             if layer.kernel.ndim != 3:
-                raise TypeError(
-                    f"GPTQ only supports EinsumDense with 2D or 3D kernels, but got {layer.kernel.ndim}D."
-                )
-
-            shape = list(self.kernel_shape)
-            # Heuristic: The largest dimension is the model's hidden size (d_model).
-            # The other two are num_heads and head_dim.
-            try:
-                d_model_dim_index = shape.index(max(shape))
-            except ValueError:
-                raise TypeError(f"Could not determine hidden dimension from shape {shape}")
-
+                raise TypeError(f"Unsupported EinsumDense kernel ndim: {layer.kernel.ndim}")
+            shape = list(layer.kernel.shape)
+            d_model_dim_index = shape.index(max(shape))
             if d_model_dim_index == 0:
-                # Case: QKV projection. Kernel shape is (d_model, num_heads, head_dim).
-                # The effective 2D weight matrix is (d_model, num_heads * head_dim).
                 in_features, heads, head_dim = shape
-                self.rows = in_features
-                self.columns = heads * head_dim
+                self.rows, self.columns = in_features, heads * head_dim
             elif d_model_dim_index == 2:
-                # Case: Attention Output projection. Kernel shape is (num_heads, head_dim, d_model).
-                # The effective 2D weight matrix is (num_heads * head_dim, d_model).
                 heads, head_dim, out_features = shape
-                self.rows = heads * head_dim
-                self.columns = out_features
+                self.rows, self.columns = heads * head_dim, out_features
             else:
-                # This case (e.g., shape `(heads, d_model, head_dim)`) is not expected.
-                raise TypeError(f"Unsupported 3D kernel arrangement in EinsumDense: {shape}")
-
-            # Create a temporary object with a reshaped 2D kernel for the algorithm.
+                raise TypeError(f"Unsupported EinsumDense shape: {shape}")
+            self.H = ops.zeros((self.rows, self.rows), dtype="float32")
             self.layer = type('temp', (object,), {
                 'kernel': ops.reshape(layer.kernel, (self.rows, self.columns)),
                 'bias': layer.bias
             })()
-        else:
-            raise TypeError(f"Unsupported layer type for GPTQ: {type(layer)}")
-        
-        print("Hesssian Matrix shape is: ", self.rows, self.rows)
 
-        # Initialize the Hessian with the *correct* number of input features (rows).
-        self.H = ops.zeros((self.rows, self.rows), dtype="float32")
 
-    def add_batch(self, inp, out=None):
-        # This function should only accumulate data into the existing self.H matrix.
-        if len(inp.shape) == 2:
+    def add_batch(self, inp):
+        if len(inp.shape) > 2:
             inp = ops.reshape(inp, (-1, inp.shape[-1]))
         inp = ops.cast(inp, "float32")
 
-        # The Hessian `H` should already be initialized in `__init__`.
-        # Let's ensure the input shape matches the expected dimension of H.
         if self.H.shape[0] != inp.shape[-1]:
             raise ValueError(
-                f"Hessian matrix dimensions ({self.H.shape}) do not match "
-                f"input dimensions ({inp.shape[-1]})."
+                f"Hessian dimensions ({self.H.shape[0]}) do not match input features ({inp.shape[-1]})."
             )
-
-        # Perform the running average update for the Hessian
+        
+        # The paper's formula is H = 2 * E[X^T X]
+        current_H = 2 * ops.matmul(ops.transpose(inp), inp)
+        
         if self.nsamples == 0:
-            # For the first batch, just calculate the initial H
-            self.H = ops.matmul(ops.transpose(inp), inp)
+            self.H = current_H
         else:
-            # For subsequent batches, perform a weighted update
             self.H = self.H * (self.nsamples / (self.nsamples + inp.shape[0]))
-            self.H += ops.matmul(ops.transpose(inp), inp)
-
+            self.H += current_H * (inp.shape[0] / (self.nsamples + inp.shape[0]))
         self.nsamples += inp.shape[0]
 
     def fasterquant(
         self, blocksize=128, percdamp=0.01, groupsize=-1, actorder=False, static_groups=False
     ):
-        # W has shape (in_features, out_features), e.g., (768, 3072) for fc1
-        W = ops.cast(self.layer.kernel, 'float32')
-        # H has shape (in_features, in_features), e.g., (768, 768)
-        H = ops.cast(self.H, 'float32')
+        # --- This is a direct and correct port of the working reference algorithm ---
+        W = ops.transpose(ops.cast(self.layer.kernel, 'float32')) # Shape: (out_features, in_features)
+        H = ops.cast(self.H, 'float32') # Shape: (in_features, in_features)
 
         # Damping
         diag = ops.diagonal(H)
@@ -103,74 +80,53 @@ class GPTQ:
         diag = ops.where(dead_mask, 1.0, diag)
         H = H - ops.diag(ops.diagonal(H)) + ops.diag(diag)
 
-        try:
-            Hinv = ops.linalg.inv(H)
-        except Exception:
-            Hinv = ops.linalg.pinv(H)
-
+        Hinv = ops.linalg.inv(H)
         Q = ops.zeros_like(W)
 
-        # --- Corrected and Stabilized Quantization Loop ---
-        for i1 in range(0, self.columns, blocksize):
-            i2 = min(i1 + blocksize, self.columns)
+        # The loops iterate over INPUT features
+        for i1 in range(0, self.rows, blocksize):
+            i2 = min(i1 + blocksize, self.rows)
             count = i2 - i1
 
             W1 = W[:, i1:i2]
             Q1 = ops.zeros_like(W1)
             Err1 = ops.zeros_like(W1)
+            Hinv1 = Hinv[i1:i2, i1:i2] # This slice is now dimensionally correct
 
-            # Inner loop for in-block updates
             for i in range(count):
-                w = W1[:, i]
+                w = W1[:, i] # w represents all connections FROM an input feature
+                d = Hinv1[i, i]
 
-                if groupsize != -1 and (i1 + i) % groupsize == 0:
-                    self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
+                if groupsize != -1:
+                    # Grouping is applied to input features
+                    if (i1 + i) % groupsize == 0:
+                        self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
                 else:
                     self.quantizer.find_params(ops.expand_dims(w, 1), weight=True)
 
                 q = quantize(
-                    ops.expand_dims(w, 1),
-                    self.quantizer.scale,
-                    self.quantizer.zero,
-                    self.quantizer.maxq
+                    ops.expand_dims(w, 1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 )[:, 0]
 
                 Q1 = ops.concatenate([Q1[:, :i], ops.expand_dims(q, 1), Q1[:, i+1:]], axis=1)
-                err = w - q
+                err = (w - q) / d
                 Err1 = ops.concatenate([Err1[:, :i], ops.expand_dims(err, 1), Err1[:, i+1:]], axis=1)
 
-                # Propagate error to remaining columns *within the block*
+                # In-block update
                 if i < count - 1:
-                    W1_rem = W1[:, i+1:]
-                    
-                    # STABILIZED UPDATE RULE
-                    v1 = ops.matmul(Hinv, ops.expand_dims(err, 1))
-                    v2 = ops.matmul(ops.expand_dims(err, 0), W1_rem)
-                    
-                    # Normalization term to prevent exploding values
-                    norm = ops.matmul(ops.expand_dims(err, 0), v1) + 1e-9 # Add epsilon
-                    
-                    update = ops.matmul(v1, v2) / norm
-                    W1 = ops.concatenate([W1[:, :i+1], W1_rem - update], axis=1)
+                    update = ops.matmul(ops.expand_dims(err, 1), ops.expand_dims(Hinv1[i, i+1:], 0))
+                    W1 = ops.concatenate([W1[:, :i+1], W1[:, i+1:] - update], axis=1)
 
-            # Update the full quantized matrix Q with the processed block
             Q = ops.concatenate([Q[:, :i1], Q1, Q[:, i2:]], axis=1)
-            
-            # Propagate the block's error to the rest of the *entire* weight matrix
-            if i2 < self.columns:
-                W_rem_total = W[:, i2:]
-                
-                # STABILIZED UPDATE RULE for the rest of the matrix
-                v1_total = ops.matmul(Hinv, Err1)
-                v2_total = ops.matmul(ops.transpose(Err1), W_rem_total)
-                
-                # Normalization term
-                norm_total = ops.trace(ops.matmul(ops.transpose(Err1), v1_total)) + 1e-9 # Add epsilon
-                
-                update_total = ops.matmul(v1_total, v2_total) / norm_total
-                W = ops.concatenate([W[:, :i2], W_rem_total - update_total], axis=1)
 
-        # Finalize the quantized weights
+            # Outer-block update
+            if i2 < self.rows:
+                update_total = ops.matmul(Err1, Hinv[i1:i2, i2:])
+                W = ops.concatenate([W[:, :i2], W[:, i2:] - update_total], axis=1)
+        
+        # Finalize and set weights, transposing back to original (in, out) shape
+        Q = ops.transpose(Q)
+        
         if isinstance(self.original_layer, EinsumDense):
             Q = ops.reshape(Q, self.kernel_shape)
 
