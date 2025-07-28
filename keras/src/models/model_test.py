@@ -869,8 +869,10 @@ class ModelTest(testing.TestCase):
             # 
             tokenizer=model.preprocessor.tokenizer,
             wbits=4,
-            nsamples=8,  # Use a very small number of samples for the test
+            nsamples=128,  # Use a very small number of samples for the test
             seqlen=128,  # Use a short sequence length
+            # act_order=True,
+            # symmetric = True
         )
 
         # 3. Run the actual quantization process by calling the config object directly.
