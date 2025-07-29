@@ -1,19 +1,20 @@
 import random
 import time
 
-import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 
 import keras
-import keras.ops as ops
+from keras.src import ops
+from keras.src import losses
+from keras.src.backend.common.global_state import clear_session as clear_session
+from keras.src import utils
 
-# Assuming these are local modules adapted for Keras 3.0
 from .gptq import GPTQ
 from .quant import Quantizer
 
 
-def eval_keras(model, dataloader, seqlen):
+def calculate_perplexity(model, dataloader, seqlen):
     """
     Evaluation loop for Perplexity using Keras 3.0.
 
@@ -45,7 +46,7 @@ def eval_keras(model, dataloader, seqlen):
             logits = outputs
         
         # Calculate loss using Keras API
-        loss_fn = keras.losses.SparseCategoricalCrossentropy(
+        loss_fn = losses.SparseCategoricalCrossentropy(
             from_logits=True, reduction=None
         )
         loss = loss_fn(ops.expand_dims(targets, -1), logits)
@@ -86,9 +87,7 @@ def get_dataloader(
         d_name, d_config = "c4", "en"
 
     # Set random seeds for reproducibility across libraries
-    random.seed(seed)
-    np.random.seed(seed)
-    keras.utils.set_random_seed(seed)
+    utils.set_random_seed(seed)
 
     # Load dataset and tokenize
     dataset = load_dataset(d_name, d_config, split="train")
@@ -102,13 +101,12 @@ def get_dataloader(
     for _ in range(nsamples):
         i = random.randint(0, len(tokenized_text) - seqlen - 1)
         sample = tokenized_text[i : i + seqlen]
-        calibration_samples.append(np.reshape(sample, (1, seqlen)))
+        calibration_samples.append(ops.reshape(sample, (1, seqlen)))
+    final_array = ops.stack(calibration_samples, axis=0)
+    return ops.convert_to_numpy(final_array)
 
-    # Return as a NumPy array for universal compatibility
-    return np.array(calibration_samples, dtype=np.int32)
 
-
-def sequential_keras(
+def apply_gptq_layerwise(
     model, dataloader, nsamples, seqlen, percdamp, groupsize, symmetric, act_order, wbits
 ):
     """Performs sequential quantization of a Keras model."""
@@ -184,16 +182,17 @@ def sequential_keras(
             for name_idx, name in enumerate(sub_layer_names):
                 inp = intermediate_inputs[name_idx]
                 
-                # --- THIS IS THE FIX ---
-                # Reshape the input tensor correctly for each layer type.
-                if name == "self_attn.out_proj":
-                    # The input to out_proj is 4D: (batch, seq_len, num_heads, head_dim)
-                    # We reshape it to (batch * seq_len, num_heads * head_dim) to match the kernel.
+                # --- Robust Reshaping Logic ---
+                # Instead of checking the layer name, check the input tensor's dimensions.
+                if len(inp.shape) == 4:
+                    # This handles the special 4D case for layers like EinsumDense out_proj
                     in_shape = ops.shape(inp)
                     inp_reshaped = ops.reshape(inp, (in_shape[0] * in_shape[1], in_shape[2] * in_shape[3]))
-                else:
-                    # All other layers have 3D input which we reshape to 2D
+                elif len(inp.shape) == 3:
+                    # This handles the standard 3D case for most layers (Dense, etc.)
                     inp_reshaped = ops.reshape(inp, (-1, ops.shape(inp)[-1]))
+                else:
+                    raise ValueError(f"Unsupported input dimension {len(inp.shape)} for layer {name}")
 
                 gptq_objects[name].add_batch(inp_reshaped)
 
@@ -219,7 +218,7 @@ def sequential_keras(
         del gptq_objects, temp_model
         if 'next_block_inputs' in locals():
             del next_block_inputs
-        keras.backend.clear_session()
+        clear_session()
 
     print("\nQuantization process complete.")
 
@@ -237,7 +236,7 @@ def quantize_model(model, config):
 
     # Perform sequential quantization
     tick = time.time()
-    sequential_keras(
+    apply_gptq_layerwise(
         model,
         dataloader,
         config.nsamples,
@@ -255,6 +254,6 @@ def quantize_model(model, config):
     test_dataloader = get_dataloader(
         config.tokenizer, config.seqlen, config.dataset, nsamples=50
     )
-    eval_keras(model, test_dataloader, config.seqlen)
+    calculate_perplexity(model, test_dataloader, config.seqlen)
 
     return model
