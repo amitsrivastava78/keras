@@ -1,4 +1,4 @@
-import keras.ops as ops
+from keras.src import ops
 
 
 def quantize(x, scale, zero, maxq):

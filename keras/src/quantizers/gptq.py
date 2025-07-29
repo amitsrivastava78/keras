@@ -1,45 +1,55 @@
-import keras
-import keras.ops as ops
-from keras.layers import Dense, EinsumDense
+from keras.src import ops
+from keras.src import backend
+from keras.src.layers import Dense, EinsumDense
+from keras.src.backend.common.global_state import clear_session as clear_session
 from .quant import quantize
 
 class GPTQ:
     def __init__(self, layer):
         self.original_layer = layer
-        self.layer = layer
         self.kernel_shape = layer.kernel.shape
-        
-        W = ops.cast(layer.kernel, 'float32')
-        self.rows = W.shape[0]
-        self.columns = W.shape[1]
-        
-        self.H = ops.zeros((self.rows, self.rows), dtype="float32")
         self.nsamples = 0
         self.quantizer = None
+
+        # Explicitly handle each supported layer type
+        if isinstance(layer, Dense):
+            # For a standard Dense layer, the dimensions are straightforward.
+            self.rows = self.kernel_shape[0]      # Input features
+            self.columns = self.kernel_shape[1]   # Output features
+            self.layer = layer # The layer itself can be used directly.
         
-        if isinstance(layer, EinsumDense):
+        elif isinstance(layer, EinsumDense):
+            # For EinsumDense, we determine the effective 2D dimensions.
             if layer.kernel.ndim != 3:
                 raise TypeError(f"Unsupported EinsumDense kernel ndim: {layer.kernel.ndim}")
-            shape = list(layer.kernel.shape)
+            
+            shape = list(self.kernel_shape)
             try:
                 d_model_dim_index = shape.index(max(shape))
             except ValueError:
                 raise TypeError(f"Could not determine hidden dimension from shape {shape}")
 
-            if d_model_dim_index == 0:
+            if d_model_dim_index == 0: # QKV projection case
                 in_features, heads, head_dim = shape
                 self.rows, self.columns = in_features, heads * head_dim
-            elif d_model_dim_index == 2:
+            elif d_model_dim_index == 2: # Attention Output case
                 heads, head_dim, out_features = shape
                 self.rows, self.columns = heads * head_dim, out_features
             else:
                 raise TypeError(f"Unsupported EinsumDense shape: {shape}")
             
-            self.H = ops.zeros((self.rows, self.rows), dtype="float32")
+            # Create a temporary object that holds a reshaped 2D version of the kernel.
             self.layer = type('temp', (object,), {
                 'kernel': ops.reshape(layer.kernel, (self.rows, self.columns)),
                 'bias': layer.bias
             })()
+        
+        else:
+            # Raise an error if the layer is not supported.
+            raise TypeError(f"Unsupported layer type for GPTQ: {type(layer)}")
+
+        # Initialize the Hessian matrix after `self.rows` is correctly set for all cases.
+        self.H = ops.zeros((self.rows, self.rows), dtype="float32")
 
     def add_batch(self, inp):
         if len(inp.shape) > 2:
@@ -61,8 +71,7 @@ class GPTQ:
         self.nsamples += inp.shape[0]
 
     def fasterquant(
-        self, blocksize=128, percdamp=0.01, groupsize=-1, actorder=False, static_groups=False
-    ):
+        self, blocksize=128, percdamp=0.01, groupsize=-1, actorder=False):
         W = ops.transpose(ops.cast(self.layer.kernel, 'float32'))
         H = ops.cast(self.H, 'float32')
 
@@ -136,4 +145,4 @@ class GPTQ:
 
     def free(self):
         self.H = None
-        keras.backend.clear_session()
+        clear_session()
