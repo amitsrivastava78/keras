@@ -877,7 +877,8 @@ class ModelTest(testing.TestCase):
 
         # 3. Run the actual quantization process by calling the config object directly.
         # This is the correct way to apply the logic to a third-party model object.
-        quantized_model = gptq_config.quantize(model)
+        # quantized_model = gptq_config.quantize(model)
+        quantized_model = model.quantize("gptq", quant_config=gptq_config)
 
         # assert isinstance(
         #     quantized_model, tf.keras.Model

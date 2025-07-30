@@ -443,11 +443,11 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                     "quantization modules are correctly placed in keras/src/quantizers."
                 )
 
-            config = kwargs.get("gptq_config")
+            config = kwargs.get("quant_config")
             print("Inside the model.py before the instance check")
             if not isinstance(config, GPTQConfig):
                 raise TypeError(
-                    "When using 'gptq' mode, you must pass a `gptq_config` "
+                    "When using 'gptq' mode, you must pass a `quant_config` "
                     "keyword argument of type `keras.quantizers.GPTQConfig`."
                 )
 
