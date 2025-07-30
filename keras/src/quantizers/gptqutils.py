@@ -89,11 +89,16 @@ def get_dataloader(
     tokenized_text = tokenizer.tokenize(full_text)
     tokenized_text = ops.convert_to_numpy(tokenized_text)
 
+    # --- START OF FIX ---
+    # Create calibration samples by taking sequential, contiguous chunks
+    # from the tokenized text, which is the standard method.
     calibration_samples = []
-    for _ in range(nsamples):
-        i = random.randint(0, len(tokenized_text) - seqlen - 1)
-        sample = tokenized_text[i : i + seqlen]
+    for i in range(nsamples):
+        start_index = i * seqlen
+        end_index = start_index + seqlen
+        sample = tokenized_text[start_index:end_index]
         calibration_samples.append(ops.reshape(sample, (1, seqlen)))
+    # --- END OF FIX ---
     final_array = ops.stack(calibration_samples, axis=0)
     return ops.convert_to_numpy(final_array)
 
@@ -128,7 +133,6 @@ def apply_gptq_layerwise(
     model,
     dataloader,
     nsamples,
-    seqlen,
     percdamp,
     groupsize,
     symmetric,
@@ -252,7 +256,6 @@ def quantize_model(model, config):
         model,
         dataloader,
         config.nsamples,
-        config.seqlen,
         config.percdamp,
         config.groupsize,
         config.symmetric,
