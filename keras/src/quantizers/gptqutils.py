@@ -7,6 +7,7 @@ from tqdm import tqdm
 import keras
 from keras.src import ops
 from keras.src import losses
+from keras.src.layers import Dense, EinsumDense
 from keras.src.backend.common.global_state import clear_session as clear_session
 from keras.src import utils
 
@@ -38,24 +39,19 @@ def calculate_perplexity(model, dataloader, seqlen):
         
         outputs = model(inputs)
 
-        # --- THIS IS THE FIX ---
-        # Check if the model output is a dictionary or a direct tensor
         if isinstance(outputs, dict):
             logits = outputs["logits"]
         else:
             logits = outputs
         
-        # Calculate loss using Keras API
         loss_fn = losses.SparseCategoricalCrossentropy(
             from_logits=True, reduction=None
         )
         loss = loss_fn(ops.expand_dims(targets, -1), logits)
 
-        # Create a mask to ignore padding tokens (assuming padding token ID is 1)
         mask = ops.cast(ops.not_equal(targets, 1), dtype="float32")
         masked_loss = loss * mask
 
-        # Accumulate total negative log-likelihood and token count
         total_nll += ops.sum(masked_loss)
         total_tokens += ops.sum(mask)
 
@@ -63,7 +59,6 @@ def calculate_perplexity(model, dataloader, seqlen):
         print("Warning: No tokens were evaluated.")
         return float("inf")
 
-    # Calculate perplexity
     ppl = ops.exp(total_nll / total_tokens)
     print(f"\nFinal Perplexity: {float(ppl):.4f}")
     return ppl
@@ -86,17 +81,14 @@ def get_dataloader(
     else:
         d_name, d_config = "c4", "en"
 
-    # Set random seeds for reproducibility across libraries
     utils.set_random_seed(seed)
 
-    # Load dataset and tokenize
     dataset = load_dataset(d_name, d_config, split="train")
     text_list = [d["text"] for d in dataset]
     full_text = "\n\n".join(text_list)
     tokenized_text = tokenizer.tokenize(full_text)
     tokenized_text = ops.convert_to_numpy(tokenized_text)
 
-    # Create calibration samples by random sampling
     calibration_samples = []
     for _ in range(nsamples):
         i = random.randint(0, len(tokenized_text) - seqlen - 1)
@@ -106,44 +98,53 @@ def get_dataloader(
     return ops.convert_to_numpy(final_array)
 
 
-# In gptqutils.py
+def _find_layers_recursive(layer, prefix, found_layers):
+    """
+    Recursively search for Dense and EinsumDense layers and record them.
+    """
+    for sub_layer in layer._layers:
+        # Construct a unique name for the layer based on its hierarchy
+        layer_name = f"{prefix}.{sub_layer.name}"
+        if isinstance(sub_layer, (Dense, EinsumDense)):
+            found_layers[layer_name] = sub_layer
+        
+        # Recurse into nested layers that are not the target types
+        elif hasattr(sub_layer, '_layers') and sub_layer._layers:
+            _find_layers_recursive(sub_layer, layer_name, found_layers)
+
 
 def find_layers_in_block(block):
     """
-    A pluggable function to find the key linear layers within a transformer block.
-    
-    This is the main function you would adapt for new model architectures.
+    A pluggable, generic function to find all Dense and EinsumDense layers
+    within any transformer block by using a recursive search.
     """
-    # --- Default Case: KerasNLP OPT Models ---
-    if hasattr(block, "_self_attention_layer"):
-        return {
-            "self_attn.q_proj": block._self_attention_layer._query_dense,
-            "self_attn.k_proj": block._self_attention_layer._key_dense,
-            "self_attn.v_proj": block._self_attention_layer._value_dense,
-            "self_attn.out_proj": block._self_attention_layer._output_dense,
-            "fc1": block._feedforward_intermediate_dense,
-            "fc2": block._feedforward_output_dense,
-        }
-    
-    # --- Example: How to Add a New Model ---
-    # To add support for another model, you would inspect its `block` and add an `elif`:
-    # elif isinstance(block, SomeOtherModelBlock):
-    #     return { "q_proj": block.attn.q_proj, ... }
-    
-    else:
-        raise ValueError(f"Unsupported transformer block type: {type(block)}. Please update `find_layers_in_block`.")
+    found_layers = {}
+    # Start the recursive search from the block itself
+    _find_layers_recursive(block, "block", found_layers)
+    return found_layers
 
-
-# In gptqutils.py
 
 def apply_gptq_layerwise(
-    model, dataloader, nsamples, seqlen, percdamp, groupsize, symmetric, act_order, wbits
+    model,
+    dataloader,
+    nsamples,
+    seqlen,
+    percdamp,
+    groupsize,
+    symmetric,
+    act_order,
+    wbits,
 ):
-    """Performs sequential quantization on a model by dynamically finding its layers."""
+    """
+    Performs sequential, model-agnostic quantization by dynamically finding
+    layers and capturing their inputs via hooks.
+    """
+    # The 'seqlen' parameter is currently unused but retained for future extensions.
     print("Starting model quantization...")
     backbone = model.backbone
     transformer_blocks = backbone.transformer_layers
 
+    # Initial inputs are the outputs of the token embedding layer
     inputs = [
         backbone.token_embedding(ops.convert_to_tensor(batch[0], dtype="int32"))
         for batch in dataloader
@@ -151,63 +152,75 @@ def apply_gptq_layerwise(
 
     for i, block in enumerate(transformer_blocks):
         print(f"\n--- Quantizing Block {i} ---")
-        
-        # 1. GENERICALLY DISCOVER the layers for the current block
+
         sub_layers_map = find_layers_in_block(block)
-        
-        gptq_objects = {name: GPTQ(layer) for name, layer in sub_layers_map.items() if layer is not None}
+        if not sub_layers_map:
+            print(f"  No Dense or EinsumDense layers found in block {i}. Skipping.")
+        else:
+            print(f"  Found layers: {list(sub_layers_map.keys())}")
+            gptq_objects = {name: GPTQ(layer) for name, layer in sub_layers_map.items()}
 
-        # 2. CAPTURE INPUTS based on the discovered structure (still requires knowledge of the forward pass)
-        def get_intermediate_inputs_for_block(block_input, current_layer):
-            if len(block_input.shape) == 2:
-                block_input = ops.expand_dims(block_input, axis=0)
-            attn_qkv_input = current_layer._self_attention_layer_norm(block_input)
-            attention_layer = current_layer._self_attention_layer
-            q = attention_layer._query_dense(attn_qkv_input)
-            k = attention_layer._key_dense(attn_qkv_input)
-            v = attention_layer._value_dense(attn_qkv_input)
-            attn_out_input, _ = attention_layer._compute_attention(q, k, v)
-            attn_output = attention_layer._output_dense(attn_out_input)
-            residual = block_input + attn_output
-            fc1_input = current_layer._feedforward_layer_norm(residual)
-            fc2_input = current_layer.activation(current_layer._feedforward_intermediate_dense(fc1_input))
-            return attn_qkv_input, attn_qkv_input, attn_qkv_input, attn_out_input, fc1_input, fc2_input
+            # --- START OF FIX ---
+            # Initialize dictionaries outside the try block to ensure they are in scope for the `finally` block.
+            captured_inputs = {name: [] for name in sub_layers_map.keys()}
+            original_calls = {}
+            # --- END OF FIX ---
 
-        block_input_tensor = keras.Input(shape=inputs[0].shape[1:], batch_size=1, dtype=inputs[0].dtype)
-        outputs_of_interest = get_intermediate_inputs_for_block(block_input_tensor, block)
-        temp_model = keras.Model(inputs=block_input_tensor, outputs=outputs_of_interest)
-        
-        sub_layer_names = list(sub_layers_map.keys())
+            def create_hook(name, original_call_func):
+                """A factory for creating a hook to capture layer inputs."""
+                def hook(*args, **kwargs):
+                    if args:
+                        inp = args[0]
+                    else:
+                        inp = kwargs["inputs"]
+                    captured_inputs[name].append(inp)
+                    return original_call_func(*args, **kwargs)
+                return hook
 
-        print(f"Building Hessians for block {i}...")
-        for j in range(nsamples):
-            current_input = inputs[j]
-            intermediate_inputs = temp_model(current_input)
-            
-            for name_idx, name in enumerate(sub_layer_names):
-                inp = intermediate_inputs[name_idx]
-                # --- THIS IS THE CORRECT, GENERIC LOGIC ---
-                # Instead of checking the layer name, check the input tensor's dimensions.
-                if len(inp.shape) == 4:
-                    # This handles the special 4D case for layers like EinsumDense out_proj
-                    in_shape = ops.shape(inp)
-                    inp_reshaped = ops.reshape(inp, (in_shape[0] * in_shape[1], in_shape[2] * in_shape[3]))
-                elif len(inp.shape) == 3:
-                    # This handles the standard 3D case for most layers (Dense, etc.)
-                    inp_reshaped = ops.reshape(inp, (-1, ops.shape(inp)[-1]))
-                else:
-                    # The input to add_batch must be 2D, so we don't need to handle the 2D case.
-                    raise ValueError(f"Unsupported input dimension {len(inp.shape)} for layer {name}")
+            try:
+                for name, layer in sub_layers_map.items():
+                    original_call = layer.call
+                    original_calls[name] = original_call
+                    layer.call = create_hook(name, original_call)
 
-                gptq_objects[name].add_batch(inp_reshaped)
+                print(f"Capturing activations for block {i}...")
+                for j in range(nsamples):
+                    current_input = inputs[j]
+                    if len(current_input.shape) == 2:
+                        current_input = ops.expand_dims(current_input, axis=0)
+                    _ = block(current_input)
 
-        quantizer = Quantizer()
-        quantizer.configure(wbits, perchannel=True, sym=symmetric, groupsize=groupsize)
-        for name, gptq_object in gptq_objects.items():
-            print(f"  Quantizing {name}...")
-            gptq_object.quantizer = quantizer
-            gptq_object.fasterquant(percdamp=percdamp, groupsize=groupsize, actorder=act_order)
-            gptq_object.free()
+            finally:
+                for name, layer in sub_layers_map.items():
+                    if name in original_calls:
+                        layer.call = original_calls[name]
+
+            print(f"Building Hessians for block {i}...")
+            for name, gptq_object in gptq_objects.items():
+                layer_inputs = ops.concatenate(captured_inputs[name], axis=0)
+
+                # --- START OF FIX ---
+                # Explicitly reshape the input tensor to be 2D, with the second
+                # dimension matching the number of input features expected by the layer's kernel.
+                # This correctly handles inputs of any dimensionality (e.g., 3D or 4D).
+                num_features = gptq_object.rows
+                inp_reshaped = ops.reshape(layer_inputs, (-1, num_features))
+                # --- END OF FIX ---
+                gptq_object.add_batch(inp_reshaped)
+
+            quantizer = Quantizer()
+            quantizer.configure(
+                wbits, perchannel=True, sym=symmetric, groupsize=groupsize
+            )
+            for name, gptq_object in gptq_objects.items():
+                print(f"  Quantizing {name}...")
+                gptq_object.quantizer = quantizer
+                gptq_object.fasterquant(
+                    percdamp=percdamp, groupsize=groupsize, actorder=act_order
+                )
+                gptq_object.free()
+
+            del gptq_objects, captured_inputs, original_calls
 
         if i < len(transformer_blocks) - 1:
             print(f"Generating inputs for block {i + 1}...")
@@ -219,11 +232,10 @@ def apply_gptq_layerwise(
                 output = block(current_input)[0]
                 next_block_inputs.append(output)
             inputs = next_block_inputs
-        
-        del gptq_objects, temp_model
-        keras.backend.clear_session()
-    print("\nQuantization process complete.")
 
+        keras.backend.clear_session()
+
+    print("\nQuantization process complete.")
 
 def quantize_model(model, config):
     """
@@ -231,12 +243,10 @@ def quantize_model(model, config):
     """
     print("Starting GPTQ quantization process...")
 
-    # Get calibration data
     dataloader = get_dataloader(
         config.tokenizer, config.seqlen, config.dataset, config.nsamples
     )
 
-    # Perform sequential quantization
     tick = time.time()
     apply_gptq_layerwise(
         model,
@@ -251,7 +261,6 @@ def quantize_model(model, config):
     )
     print(f"Total quantization time: {time.time() - tick:.2f} seconds")
 
-    # Evaluate the quantized model
     print("\nLoading test data for evaluation...")
     test_dataloader = get_dataloader(
         config.tokenizer, config.seqlen, config.dataset, nsamples=50

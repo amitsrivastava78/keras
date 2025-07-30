@@ -48,6 +48,7 @@ class GPTQ:
             # Raise an error if the layer is not supported.
             raise TypeError(f"Unsupported layer type for GPTQ: {type(layer)}")
 
+        print("Hessian Matrix is: ", self.rows, self.rows)
         # Initialize the Hessian matrix after `self.rows` is correctly set for all cases.
         self.H = ops.zeros((self.rows, self.rows), dtype="float32")
 
