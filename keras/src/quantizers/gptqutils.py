@@ -106,70 +106,75 @@ def get_dataloader(
     return ops.convert_to_numpy(final_array)
 
 
+# In gptqutils.py
+
+def find_layers_in_block(block):
+    """
+    A pluggable function to find the key linear layers within a transformer block.
+    
+    This is the main function you would adapt for new model architectures.
+    """
+    # --- Default Case: KerasNLP OPT Models ---
+    if hasattr(block, "_self_attention_layer"):
+        return {
+            "self_attn.q_proj": block._self_attention_layer._query_dense,
+            "self_attn.k_proj": block._self_attention_layer._key_dense,
+            "self_attn.v_proj": block._self_attention_layer._value_dense,
+            "self_attn.out_proj": block._self_attention_layer._output_dense,
+            "fc1": block._feedforward_intermediate_dense,
+            "fc2": block._feedforward_output_dense,
+        }
+    
+    # --- Example: How to Add a New Model ---
+    # To add support for another model, you would inspect its `block` and add an `elif`:
+    # elif isinstance(block, SomeOtherModelBlock):
+    #     return { "q_proj": block.attn.q_proj, ... }
+    
+    else:
+        raise ValueError(f"Unsupported transformer block type: {type(block)}. Please update `find_layers_in_block`.")
+
+
+# In gptqutils.py
+
 def apply_gptq_layerwise(
     model, dataloader, nsamples, seqlen, percdamp, groupsize, symmetric, act_order, wbits
 ):
-    """Performs sequential quantization of a Keras model."""
+    """Performs sequential quantization on a model by dynamically finding its layers."""
     print("Starting model quantization...")
-
-    if not hasattr(model, "backbone"):
-        raise ValueError("Model must have a `backbone` attribute.")
     backbone = model.backbone
-    layers = backbone.transformer_layers
+    transformer_blocks = backbone.transformer_layers
 
-    print("Getting initial embeddings...")
     inputs = [
         backbone.token_embedding(ops.convert_to_tensor(batch[0], dtype="int32"))
         for batch in dataloader
     ]
 
-    for i in range(len(layers)):
+    for i, block in enumerate(transformer_blocks):
         print(f"\n--- Quantizing Block {i} ---")
-        layer = layers[i]
-
-        sub_layers_map = {
-            "self_attn.q_proj": layer._self_attention_layer._query_dense,
-            "self_attn.k_proj": layer._self_attention_layer._key_dense,
-            "self_attn.v_proj": layer._self_attention_layer._value_dense,
-            "self_attn.out_proj": layer._self_attention_layer._output_dense,
-            "fc1": layer._feedforward_intermediate_dense,
-            "fc2": layer._feedforward_output_dense,
-        }
         
-        gptq_objects = {}
-        for name, sub_layer in sub_layers_map.items():
-            if sub_layer is None: continue
-            gptq_objects[name] = GPTQ(sub_layer)
-            quantizer = Quantizer()
-            quantizer.configure(wbits, perchannel=True, sym=symmetric)
-            gptq_objects[name].quantizer = quantizer
+        # 1. GENERICALLY DISCOVER the layers for the current block
+        sub_layers_map = find_layers_in_block(block)
+        
+        gptq_objects = {name: GPTQ(layer) for name, layer in sub_layers_map.items() if layer is not None}
 
+        # 2. CAPTURE INPUTS based on the discovered structure (still requires knowledge of the forward pass)
         def get_intermediate_inputs_for_block(block_input, current_layer):
             if len(block_input.shape) == 2:
                 block_input = ops.expand_dims(block_input, axis=0)
-
             attn_qkv_input = current_layer._self_attention_layer_norm(block_input)
-            
             attention_layer = current_layer._self_attention_layer
-            query = attention_layer._query_dense(attn_qkv_input)
-            key = attention_layer._key_dense(attn_qkv_input)
-            value = attention_layer._value_dense(attn_qkv_input)
-            
-            attn_out_input, _ = attention_layer._compute_attention(query, key, value)
-            
+            q = attention_layer._query_dense(attn_qkv_input)
+            k = attention_layer._key_dense(attn_qkv_input)
+            v = attention_layer._value_dense(attn_qkv_input)
+            attn_out_input, _ = attention_layer._compute_attention(q, k, v)
             attn_output = attention_layer._output_dense(attn_out_input)
             residual = block_input + attn_output
-
             fc1_input = current_layer._feedforward_layer_norm(residual)
-            
-            fc2_input = current_layer.activation(
-                current_layer._feedforward_intermediate_dense(fc1_input)
-            )
-            
+            fc2_input = current_layer.activation(current_layer._feedforward_intermediate_dense(fc1_input))
             return attn_qkv_input, attn_qkv_input, attn_qkv_input, attn_out_input, fc1_input, fc2_input
 
         block_input_tensor = keras.Input(shape=inputs[0].shape[1:], batch_size=1, dtype=inputs[0].dtype)
-        outputs_of_interest = get_intermediate_inputs_for_block(block_input_tensor, layer)
+        outputs_of_interest = get_intermediate_inputs_for_block(block_input_tensor, block)
         temp_model = keras.Model(inputs=block_input_tensor, outputs=outputs_of_interest)
         
         sub_layer_names = list(sub_layers_map.keys())
@@ -181,8 +186,7 @@ def apply_gptq_layerwise(
             
             for name_idx, name in enumerate(sub_layer_names):
                 inp = intermediate_inputs[name_idx]
-                
-                # --- Robust Reshaping Logic ---
+                # --- THIS IS THE CORRECT, GENERIC LOGIC ---
                 # Instead of checking the layer name, check the input tensor's dimensions.
                 if len(inp.shape) == 4:
                     # This handles the special 4D case for layers like EinsumDense out_proj
@@ -192,34 +196,32 @@ def apply_gptq_layerwise(
                     # This handles the standard 3D case for most layers (Dense, etc.)
                     inp_reshaped = ops.reshape(inp, (-1, ops.shape(inp)[-1]))
                 else:
+                    # The input to add_batch must be 2D, so we don't need to handle the 2D case.
                     raise ValueError(f"Unsupported input dimension {len(inp.shape)} for layer {name}")
 
                 gptq_objects[name].add_batch(inp_reshaped)
 
+        quantizer = Quantizer()
+        quantizer.configure(wbits, perchannel=True, sym=symmetric, groupsize=groupsize)
         for name, gptq_object in gptq_objects.items():
             print(f"  Quantizing {name}...")
+            gptq_object.quantizer = quantizer
             gptq_object.fasterquant(percdamp=percdamp, groupsize=groupsize, actorder=act_order)
             gptq_object.free()
 
-        if i < len(layers) - 1:
+        if i < len(transformer_blocks) - 1:
             print(f"Generating inputs for block {i + 1}...")
             next_block_inputs = []
             for j in range(nsamples):
-                # --- DEFENSIVE SHAPE CORRECTION ---
-                # Force the input to be 3D before passing it to the quantized layer.
                 current_input = inputs[j]
                 if len(current_input.shape) == 2:
                     current_input = ops.expand_dims(current_input, axis=0)
-                
-                output = layer(current_input)[0]
+                output = block(current_input)[0]
                 next_block_inputs.append(output)
             inputs = next_block_inputs
         
         del gptq_objects, temp_model
-        if 'next_block_inputs' in locals():
-            del next_block_inputs
-        clear_session()
-
+        keras.backend.clear_session()
     print("\nQuantization process complete.")
 
 

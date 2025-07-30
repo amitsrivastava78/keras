@@ -93,6 +93,9 @@ class Quantizer:
                 self.scale = ops.tile(ops.reshape(self.scale, (1, 1)), (num_rows, 1))
                 self.zero = ops.tile(ops.reshape(self.zero, (1, 1)), (num_rows, 1))
         # --- END OF FIX ---
+        if self.perchannel:
+            self.scale = ops.reshape(self.scale, [-1, 1])
+            self.zero = ops.reshape(self.zero, [-1, 1])
 
     def ready(self):
         """Checks if the quantization parameters have been computed."""
