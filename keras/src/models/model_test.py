@@ -25,9 +25,6 @@ from keras.src.models.model import model_from_json
 from keras.src.quantizers.gptqconfig import GPTQConfig
 from transformers import AutoTokenizer, TFAutoModelForCausalLM
 
-print(f"\nDEBUG ==> Test is using Python from: {sys.executable}")
-print(f"DEBUG ==> Test is using Keras from: {keras.__file__}\n")
-
 def _get_model():
     input_a = Input(shape=(3,), batch_size=2, name="input_a")
     input_b = Input(shape=(3,), batch_size=2, name="input_b")
@@ -871,18 +868,21 @@ class ModelTest(testing.TestCase):
         #     backbone.get_layer("transformer_layer_0")
         #     .self_attention.query.kernel.numpy()
         # )
-
+        long_text = """auto-gptq is an easy-to-use model quantization library with user-friendly apis, based on GPTQ algorithm.
+        The goal is to quantize pre-trained models to 4-bit or even 3-bit precision with minimal performance degradation.
+        This allows for running larger models on less powerful hardware, reducing memory footprint and increasing inference speed.
+        The process involves calibrating the model on a small dataset to determine the quantization parameters.
+        This technique is particularly useful for deploying large language models in resource-constrained environments where every bit of memory and every millisecond of latency counts."""
+        dataset = [long_text]
         # 2. Create the GPTQ configuration.
         gptq_config = GPTQConfig(
-            dataset="wikitext2",
-            # 
+            # dataset="wikitext2",
+            dataset=dataset,
             tokenizer=model.preprocessor.tokenizer,
             wbits=4,
-            nsamples=128,  # Use a very small number of samples for the test
-            seqlen=128,  # Use a short sequence length
-            groupsize=16,
-            # act_order=True,
-            # symmetric = True
+            nsamples=128,
+            seqlen=128,
+            groupsize=128,
         )
 
         # 3. Run the actual quantization process by calling the config object directly.

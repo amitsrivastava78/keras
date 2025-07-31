@@ -2,6 +2,7 @@ import random
 import time
 
 from datasets import load_dataset
+import numpy as np
 from tqdm import tqdm
 
 import keras
@@ -64,41 +65,113 @@ def calculate_perplexity(model, dataloader, seqlen):
     return ppl
 
 
+import numpy as np
+from keras.src import ops, utils
+from datasets import load_dataset
+
+import numpy as np
+from keras.src import ops, utils
+from datasets import load_dataset
+
 def get_dataloader(
-    tokenizer, seqlen, dataset_name="wikitext2", nsamples=128, seed=0
+    tokenizer, seqlen, dataset, nsamples=128, seed=0
 ):
     """
-    Prepares the calibration dataloader with RANDOM SAMPLING.
-
-    This function is now fully backend-agnostic and returns a NumPy array,
-    which is compatible with all Keras backends.
+    Prepares and chunks the calibration dataloader, repeating short datasets.
     """
-    print(f"Loading '{dataset_name}' dataset for calibration...")
-    if dataset_name == "wikitext2":
-        d_name, d_config = "wikitext", "wikitext-2-raw-v1"
-    elif dataset_name == "ptb":
-        d_name, d_config = "ptb_text_only", "penn_treebank"
+    all_tokens = []
+
+    # --- Step 1: Unify all input types into a single list of tokens ---
+    if isinstance(dataset, str):
+        print(f"Loading '{dataset}' dataset from Hub...")
+        if dataset == "wikitext2":
+            d_name, d_config = "wikitext", "wikitext-2-raw-v1"
+        elif dataset == "ptb":
+            d_name, d_config = "ptb_text_only", "penn_treebank"
+        # --- START OF C4-SPECIFIC FIX ---
+        elif dataset == "c4":
+            print("   -> Using memory-efficient streaming strategy for C4.")
+            streaming_dataset = load_dataset('allenai/c4', 'en', split='train', streaming=True)
+            dataset_head = streaming_dataset.take(nsamples * 5)
+            
+            samples = []
+            docs_for_sampling = list(dataset_head)
+
+            for _ in range(nsamples):
+                while True:
+                    doc = random.choice(docs_for_sampling)
+                    try:
+                        # Call the tokenizer layer directly (the KerasNLP way)
+                        # and squeeze the output to a 1D array.
+                        tokenized_doc = np.squeeze(tokenizer(doc['text']))
+                        if len(tokenized_doc) >= seqlen:
+                            break
+                    except Exception:
+                        docs_for_sampling.remove(doc)
+                        if not docs_for_sampling:
+                            raise ValueError("Could not find enough valid documents in the C4 sample.")
+                        continue
+            
+                j = random.randint(0, len(tokenized_doc) - seqlen - 1)
+                sample_slice = tokenized_doc[j : j + seqlen]
+                samples.append(np.reshape(sample_slice, (1, seqlen)))
+            
+            return np.array(samples, dtype=np.int32)
+        # --- END OF C4-SPECIFIC FIX ---
+        else:
+            print(f"Warning: No specific alias found for '{dataset}'.")
+            print(f"Attempting to load '{dataset}' directly with its default configuration.")
+            d_name = dataset
+            d_config = None # Use the default configuration for the dataset
+
+        if d_name == "ptb_text_only":
+            text_column = "sentence"
+        else:
+        # Default to "text" for wikitext2 and other datasets
+            text_column = "text"
+        
+        raw_dataset = load_dataset(d_name, d_config, split="train")
+        text_list = [d[text_column] for d in raw_dataset]
+        full_text = "\n\n".join(text_list)
+        all_tokens = tokenizer.tokenize(full_text)
+
     else:
-        d_name, d_config = "c4", "en"
+        print("\n==> Using pre-made dataset/generator...")
+        dataset_list = list(dataset)
+        
+        if not dataset_list:
+            raise ValueError("Provided dataset is empty.")
 
+        if isinstance(dataset_list[0], str):
+            print("   (Dataset contains strings, tokenizing now...)")
+            full_text = "\n\n".join(dataset_list)
+            all_tokens = tokenizer.tokenize(full_text)
+        else:
+            print("   (Dataset is pre-tokenized, concatenating...)")
+            concatenated_tokens = ops.concatenate(
+                [ops.reshape(s, [-1]) for s in dataset_list], axis=0
+            )
+            all_tokens = ops.convert_to_numpy(concatenated_tokens)
+
+    all_tokens = np.array(all_tokens, dtype=np.int32)
+
+    # --- Step 2: Repeat data if it's too short ---
+    required_tokens = nsamples * seqlen
+    if len(all_tokens) < required_tokens:
+        print(f"Warning: Dataset is too short ({len(all_tokens)} tokens). Repeating data to generate {nsamples} samples.")
+        repeats = -(-required_tokens // len(all_tokens))  # Ceiling division
+        all_tokens = np.tile(all_tokens, repeats)
+    
+    # --- Step 3: Chunk the token list into samples ---
     utils.set_random_seed(seed)
-
-    dataset = load_dataset(d_name, d_config, split="train")
-    text_list = [d["text"] for d in dataset]
-    full_text = "\n\n".join(text_list)
-    tokenized_text = tokenizer.tokenize(full_text)
-    tokenized_text = ops.convert_to_numpy(tokenized_text)
-
-    # --- START OF FIX ---
-    # Create calibration samples by taking sequential, contiguous chunks
-    # from the tokenized text, which is the standard method.
+    
     calibration_samples = []
     for i in range(nsamples):
         start_index = i * seqlen
         end_index = start_index + seqlen
-        sample = tokenized_text[start_index:end_index]
+        sample = all_tokens[start_index:end_index]
         calibration_samples.append(ops.reshape(sample, (1, seqlen)))
-    # --- END OF FIX ---
+    
     final_array = ops.stack(calibration_samples, axis=0)
     return ops.convert_to_numpy(final_array)
 
@@ -250,7 +323,7 @@ def quantize_model(model, config):
     dataloader = get_dataloader(
         config.tokenizer, config.seqlen, config.dataset, config.nsamples
     )
-
+    
     tick = time.time()
     apply_gptq_layerwise(
         model,
