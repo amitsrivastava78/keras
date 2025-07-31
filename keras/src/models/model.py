@@ -435,7 +435,6 @@ class Model(Trainer, base_trainer.Trainer, Layer):
 
         if mode == "gptq":
             try:
-                print("Inside the model.py before the GPTQ import")
                 from keras.src.quantizers.gptqconfig import GPTQConfig
             except ImportError:
                 raise ImportError(
@@ -447,14 +446,12 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             print("Inside the model.py before the instance check")
             if not isinstance(config, GPTQConfig):
                 raise TypeError(
-                    "When using 'gptq' mode, you must pass a `quant_config` "
+                    "When using 'gptq' mode, you must pass a `gptq_config` "
                     "keyword argument of type `keras.quantizers.GPTQConfig`."
                 )
 
             # The config object's own quantize method drives the process.
-            print("Just before the quantize call")
             quantized_model = config.quantize(self)
-            print(f"DEBUG: Value returned from config.quantize: {quantized_model}")
             return quantized_model
 
         type_check = kwargs.pop("type_check", True)
