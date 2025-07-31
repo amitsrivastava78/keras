@@ -65,14 +65,6 @@ def calculate_perplexity(model, dataloader, seqlen):
     return ppl
 
 
-import numpy as np
-from keras.src import ops, utils
-from datasets import load_dataset
-
-import numpy as np
-from keras.src import ops, utils
-from datasets import load_dataset
-
 def get_dataloader(
     tokenizer, seqlen, dataset, nsamples=128, seed=0
 ):
