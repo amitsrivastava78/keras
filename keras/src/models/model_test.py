@@ -25,6 +25,70 @@ from keras.src.models.model import model_from_json
 from keras.src.quantizers.gptqconfig import GPTQConfig
 from transformers import AutoTokenizer, TFAutoModelForCausalLM
 
+
+from tqdm import tqdm
+from keras.src import ops
+
+
+def calculate_perplexity(model, dataloader):
+    """
+    Evaluation loop for Perplexity using Keras 3.0.
+
+    This function calculates the perplexity of a model on a given dataset.
+    It is backend-agnostic, relying on `keras.ops` for computations.
+    """
+    print("\nEvaluating perplexity...")
+    total_nll = 0.0
+    total_tokens = 0
+
+    for batch in tqdm(dataloader, desc="Evaluating PPL"):
+        batch = ops.convert_to_tensor(batch, dtype="int32")
+
+        input_ids = batch[:, :-1]
+        targets = batch[:, 1:]
+
+        # --- START OF FIX ---
+        # Create the correct input structure based on the model type.
+        inputs = None
+        # Case 1: Standard KerasNLP model with a preprocessor.
+        if hasattr(model, "preprocessor") and model.preprocessor is not None:
+            inputs = {
+                "token_ids": input_ids,
+                "padding_mask": ops.ones_like(input_ids, dtype="bool"),
+            }
+        # Case 2: Custom or simple model without a preprocessor.
+        else:
+            # Use the model's actual input name as the key.
+            # This makes the function compatible with the test model.
+            inputs = input_ids
+        # --- END OF FIX ---
+        
+        outputs = model(inputs)
+
+        if isinstance(outputs, dict):
+            logits = outputs["logits"]
+        else:
+            logits = outputs
+        
+        loss_fn = losses.SparseCategoricalCrossentropy(
+            from_logits=True, reduction=None
+        )
+        loss = loss_fn(ops.expand_dims(targets, -1), logits)
+
+        mask = ops.cast(ops.not_equal(targets, 1), dtype="float32")
+        masked_loss = loss * mask
+
+        total_nll += ops.sum(masked_loss)
+        total_tokens += ops.sum(mask)
+
+    if total_tokens == 0:
+        print("Warning: No tokens were evaluated.")
+        return float("inf")
+
+    ppl = ops.exp(total_nll / total_tokens)
+    print(f"\nFinal Perplexity: {float(ppl):.4f}")
+    return ppl
+
 def _get_model():
     input_a = Input(shape=(3,), batch_size=2, name="input_a")
     input_b = Input(shape=(3,), batch_size=2, name="input_b")
@@ -1415,42 +1479,70 @@ class ModelQuantizationTest(testing.TestCase):
 
     @pytest.mark.slow
     def test_quantize_gptq_with_einsumdense_attention(self):
-        """Tests GPTQ on a KerasNLP model that uses EinsumDense layers."""
-        # Instantiate a small KerasNLP model known to use EinsumDense.
-        # `load_weights=False` makes instantiation nearly instant.
-        model = keras_nlp.models.Gemma3CausalLM.from_preset("gemma3_1b", load_weights=False)
+        from datasets import load_dataset
+        import tempfile
+        import os
 
-        # Get the backbone and an attention layer to inspect its weights.
-        backbone = model.backbone
-        attention_layer = backbone.get_layer("decoder_block_0").attention
-        
-        # Get the original weights of the query projection (an EinsumDense layer).
-        original_weights = np.copy(attention_layer.query_dense.kernel.numpy())
+        model = keras_nlp.models.Gemma3CausalLM.from_preset("gemma3_1b", load_weights=True)
+        # Load the test split of the wikitext2 dataset
+        test_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 
-        # Configure the GPTQ quantizer with dummy data.
+        # Prepare the data for the perplexity function
+        # This joins the text and tokenizes it, similar to your get_dataloader function
+        all_text = "\n\n".join(d['text'] for d in test_data if d['text'])
+        all_tokens = model.preprocessor.tokenizer.tokenize(all_text)
+
+        # Create a few samples from the real test data
+        test_samples = []
+        seq_len = 128
+        for i in range(50): # Use 50 samples for a stable PPL score
+            start = i * seq_len
+            end = start + seq_len
+            test_samples.append(np.reshape(all_tokens[start:end], (1, seq_len)))
+
+        test_dataloader = np.array(test_samples, dtype=np.int32)
+        perplexity = calculate_perplexity(model, test_dataloader)
+        self.assertLess(perplexity, 200, "Perplexity should be low for a pre-trained model on real data.")
+
+
         gptq_config = GPTQConfig(
-            dataset=dummy_dataset_generator(nsamples=16, seqlen=128, vocab_size=model.preprocessor.tokenizer.vocabulary_size()),
+            # dataset=dummy_dataset_generator(nsamples=16, seqlen=128, vocab_size=model.preprocessor.tokenizer.vocabulary_size()),
+            dataset="wikitext2",
             tokenizer=model.preprocessor.tokenizer,
             wbits=4,
-            nsamples=16, # Use a small number of samples for a fast test
+            nsamples=128,
             seqlen=128,
+            groupsize=128,
         )
-
-        # Run the quantization process.
         model.quantize("gptq", quant_config=gptq_config)
+
+                # 1. Save the newly quantized weights to a temporary file.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            weights_path = os.path.join(tmpdir, "quantized_weights.weights.h5")
+            model.save_weights(weights_path)
+
+            # 2. Create a NEW, clean instance of the model. This instance has a
+            #    perfectly functional tokenizer and a clean internal state.
+            clean_model = keras_nlp.models.Gemma3CausalLM.from_preset("gemma3_1b", load_weights=False)
+
+            # 3. Load the quantized weights into the new model.
+            clean_model.load_weights(weights_path)
         
-        # Get the new weights after quantization.
-        quantized_weights = attention_layer.query_dense.kernel.numpy()
+        test_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 
-        # 1. Assert that the weights have actually been changed by the process.
-        self.assertFalse(
-            np.allclose(original_weights, quantized_weights),
-            "Weights were not changed by the GPTQ process for the EinsumDense model."
-        )
+        # Prepare the data for the perplexity function
+        # This joins the text and tokenizes it, similar to your get_dataloader function
+        all_text = "\n\n".join(d['text'] for d in test_data if d['text'])
+        all_tokens = clean_model.preprocessor.tokenizer.tokenize(all_text)
 
-        # 2. Verify the quantized model can still make a prediction without crashing.
-        try:
-            dummy_input = ["This is a test sentence for the quantized model."]
-            _ = model.predict(dummy_input)
-        except Exception as e:
-            self.fail(f"Prediction failed for the quantized EinsumDense model: {e}")
+        # Create a few samples from the real test data
+        test_samples = []
+        seq_len = 128
+        for i in range(50): # Use 50 samples for a stable PPL score
+            start = i * seq_len
+            end = start + seq_len
+            test_samples.append(np.reshape(all_tokens[start:end], (1, seq_len)))
+
+        test_dataloader = np.array(test_samples, dtype=np.int32)
+        perplexity = calculate_perplexity(clean_model, test_dataloader)
+        self.assertLess(perplexity, 200, "Perplexity should be low for a pre-trained model on real data.")

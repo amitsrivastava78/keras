@@ -380,10 +380,9 @@ def quantize_model(model, config):
     print(f"Total quantization time: {time.time() - tick:.2f} seconds")
 
     # Only run evaluation if there is data in the test set.
-    if test_dataloader.size > 0:
-        print("\nLoading test data for evaluation...")
-        calculate_perplexity(model, test_dataloader, config.seqlen)
-    else:
-        print("\nSkipping perplexity evaluation: Not enough data to create a test set.")
-
+    # if test_dataloader.size > 0:
+    #     print("\nLoading test data for evaluation...")
+    #     calculate_perplexity(model, test_dataloader, config.seqlen)
+    # else:
+    #     print("\nSkipping perplexity evaluation: Not enough data to create a test set.")
     return model
