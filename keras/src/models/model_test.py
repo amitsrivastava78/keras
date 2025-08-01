@@ -1310,3 +1310,147 @@ class ModelTest(testing.TestCase):
                 ),
             ):
                 model.export(temp_filepath, format="tf_saved_model")
+
+
+
+import keras
+import keras_nlp
+import numpy as np
+import pytest
+from keras.src import layers, models, testing
+from keras.src.quantizers.gptqconfig import GPTQConfig
+
+# Helper function to generate dummy data for quick testing.
+def dummy_dataset_generator(nsamples, seqlen, vocab_size=1000):
+    """A generator that yields random numpy arrays for fast, self-contained tests."""
+    for _ in range(nsamples):
+        yield np.random.randint(0, vocab_size, size=(1, seqlen))
+
+# Helper function to build a simple transformer model that uses standard 
+# Keras `Dense` layers for its attention projections.
+def _get_model_with_dense_attention():
+    """Builds a simple transformer model using Dense for attention."""
+    vocab_size = 1000
+    embed_dim = 32
+    num_heads = 4
+    ff_dim = 32
+    seq_len = 128
+
+    class SimpleTransformerBlock(layers.Layer):
+        def __init__(self, embed_dim, num_heads, ff_dim, **kwargs):
+            super().__init__(**kwargs)
+            # The standard MultiHeadAttention layer uses Dense layers for its projections.
+            self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+            self.ffn = models.Sequential(
+                [layers.Dense(ff_dim, activation="relu"), layers.Dense(embed_dim),]
+            )
+            self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+            self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+
+        def call(self, inputs):
+            attention_output = self.att(inputs, inputs)
+            out1 = self.layernorm1(inputs + attention_output)
+            ffn_output = self.ffn(out1)
+            return self.layernorm2(out1 + ffn_output)
+
+    inputs = layers.Input(shape=(None,), dtype="int32")
+    embedding_layer = layers.Embedding(vocab_size, embed_dim)
+    x = embedding_layer(inputs)
+    transformer_block = SimpleTransformerBlock(embed_dim, num_heads, ff_dim)
+    x = transformer_block(x)
+    outputs = layers.Dense(vocab_size)(x)
+    model = models.Model(inputs=inputs, outputs=outputs)
+    return model
+
+@pytest.mark.requires_trainable_backend
+class ModelQuantizationTest(testing.TestCase):
+    
+    @pytest.mark.slow
+    def test_quantize_gptq_with_dense_attention(self):
+        """Tests GPTQ on a model with Dense layers in its attention block."""
+        model = _get_model_with_dense_attention()
+        
+        # Create a mock tokenizer for the config, as the model is simple.
+        long_text = """auto-gptq is an easy-to-use model quantization library with user-friendly apis, based on GPTQ algorithm.
+        The goal is to quantize pre-trained models to 4-bit or even 3-bit precision with minimal performance degradation.
+        This allows for running larger models on less powerful hardware, reducing memory footprint and increasing inference speed.
+        The process involves calibrating the model on a small dataset to determine the quantization parameters.
+        This technique is particularly useful for deploying large language models in resource-constrained environments where every bit of memory and every millisecond of latency counts."""
+        dataset = [long_text]
+
+        mock_tokenizer = lambda text: np.array([ord(c) for c in text])
+        mock_tokenizer.tokenize = mock_tokenizer
+
+        # Get original weights from a dense layer to compare against after quantization.
+        original_weights = np.copy(model.layers[2].ffn.layers[0].kernel.numpy())
+
+        # Configure the GPTQ quantizer with dummy data.
+        gptq_config = GPTQConfig(
+            dataset=dummy_dataset_generator(nsamples=16, seqlen=128, vocab_size=1000),
+            tokenizer=mock_tokenizer,
+            wbits=4,
+            nsamples=16,  # Use a small number of samples for a fast test
+            seqlen=128,
+            groupsize=32, # Use a smaller group size for the smaller layers
+        )
+
+        # Run the quantization process.
+        model.quantize("gptq", quant_config=gptq_config)
+
+        # Get the new weights after quantization.
+        quantized_weights = model.layers[2].ffn.layers[0].kernel.numpy()
+
+        # 1. Assert that the weights have actually been changed by the process.
+        self.assertFalse(
+            np.allclose(original_weights, quantized_weights),
+            "Weights were not changed by the GPTQ process for the Dense attention model."
+        )
+        
+        # 2. Verify the quantized model can still make a prediction without crashing.
+        try:
+            dummy_input = np.random.randint(0, 1000, size=(1, 128))
+            _ = model.predict(dummy_input)
+        except Exception as e:
+            self.fail(f"Prediction failed for the quantized Dense attention model: {e}")
+
+    @pytest.mark.slow
+    def test_quantize_gptq_with_einsumdense_attention(self):
+        """Tests GPTQ on a KerasNLP model that uses EinsumDense layers."""
+        # Instantiate a small KerasNLP model known to use EinsumDense.
+        # `load_weights=False` makes instantiation nearly instant.
+        model = keras_nlp.models.GemmaCausalLM.from_preset("gemma_2b_en", load_weights=False)
+
+        # Get the backbone and an attention layer to inspect its weights.
+        backbone = model.backbone
+        attention_layer = backbone.get_layer("transformer_layer_0")._self_attention_layer
+        
+        # Get the original weights of the query projection (an EinsumDense layer).
+        original_weights = np.copy(attention_layer._query_dense.kernel.numpy())
+
+        # Configure the GPTQ quantizer with dummy data.
+        gptq_config = GPTQConfig(
+            dataset=dummy_dataset_generator(nsamples=16, seqlen=128, vocab_size=model.preprocessor.tokenizer.vocabulary_size()),
+            tokenizer=model.preprocessor.tokenizer,
+            wbits=4,
+            nsamples=16, # Use a small number of samples for a fast test
+            seqlen=128,
+        )
+
+        # Run the quantization process.
+        model.quantize("gptq", quant_config=gptq_config)
+        
+        # Get the new weights after quantization.
+        quantized_weights = attention_layer._query_dense.kernel.numpy()
+
+        # 1. Assert that the weights have actually been changed by the process.
+        self.assertFalse(
+            np.allclose(original_weights, quantized_weights),
+            "Weights were not changed by the GPTQ process for the EinsumDense model."
+        )
+
+        # 2. Verify the quantized model can still make a prediction without crashing.
+        try:
+            dummy_input = ["This is a test sentence for the quantized model."]
+            _ = model.predict(dummy_input)
+        except Exception as e:
+            self.fail(f"Prediction failed for the quantized EinsumDense model: {e}")

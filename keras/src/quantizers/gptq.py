@@ -32,7 +32,7 @@ class GPTQ:
             if d_model_dim_index == 0: # QKV projection case
                 in_features, heads, head_dim = shape
                 self.rows, self.columns = in_features, heads * head_dim
-            elif d_model_dim_index == 2: # Attention Output case
+            elif d_model_dim_index in [1, 2]: # Attention Output case
                 heads, head_dim, out_features = shape
                 self.rows, self.columns = heads * head_dim, out_features
             else:
