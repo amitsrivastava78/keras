@@ -876,8 +876,8 @@ class ModelTest(testing.TestCase):
         dataset = [long_text]
         # 2. Create the GPTQ configuration.
         gptq_config = GPTQConfig(
-            # dataset="wikitext2",
-            dataset=dataset,
+            dataset="wikitext2",
+            # dataset=dataset,
             tokenizer=model.preprocessor.tokenizer,
             wbits=4,
             nsamples=128,
@@ -1418,14 +1418,14 @@ class ModelQuantizationTest(testing.TestCase):
         """Tests GPTQ on a KerasNLP model that uses EinsumDense layers."""
         # Instantiate a small KerasNLP model known to use EinsumDense.
         # `load_weights=False` makes instantiation nearly instant.
-        model = keras_nlp.models.GemmaCausalLM.from_preset("gemma_2b_en", load_weights=False)
+        model = keras_nlp.models.Gemma3CausalLM.from_preset("gemma3_1b", load_weights=False)
 
         # Get the backbone and an attention layer to inspect its weights.
         backbone = model.backbone
-        attention_layer = backbone.get_layer("transformer_layer_0")._self_attention_layer
+        attention_layer = backbone.get_layer("decoder_block_0").attention
         
         # Get the original weights of the query projection (an EinsumDense layer).
-        original_weights = np.copy(attention_layer._query_dense.kernel.numpy())
+        original_weights = np.copy(attention_layer.query_dense.kernel.numpy())
 
         # Configure the GPTQ quantizer with dummy data.
         gptq_config = GPTQConfig(
@@ -1440,7 +1440,7 @@ class ModelQuantizationTest(testing.TestCase):
         model.quantize("gptq", quant_config=gptq_config)
         
         # Get the new weights after quantization.
-        quantized_weights = attention_layer._query_dense.kernel.numpy()
+        quantized_weights = attention_layer.query_dense.kernel.numpy()
 
         # 1. Assert that the weights have actually been changed by the process.
         self.assertFalse(

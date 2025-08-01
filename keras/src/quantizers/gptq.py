@@ -12,17 +12,15 @@ class GPTQ:
         self.quantizer = None
 
         # Explicitly handle each supported layer type
-        if isinstance(layer, Dense):
+        if isinstance(layer, Dense) or (isinstance(layer, EinsumDense) and layer.kernel.ndim == 2):
             # For a standard Dense layer, the dimensions are straightforward.
             self.rows = self.kernel_shape[0]      # Input features
             self.columns = self.kernel_shape[1]   # Output features
             self.layer = layer # The layer itself can be used directly.
-        
-        elif isinstance(layer, EinsumDense):
+
+        # Handle 3D EinsumDense layers (typically from attention blocks).
+        elif isinstance(layer, EinsumDense) and layer.kernel.ndim == 3:
             # For EinsumDense, we determine the effective 2D dimensions.
-            if layer.kernel.ndim != 3:
-                raise TypeError(f"Unsupported EinsumDense kernel ndim: {layer.kernel.ndim}")
-            
             shape = list(self.kernel_shape)
             try:
                 d_model_dim_index = shape.index(max(shape))
@@ -35,18 +33,16 @@ class GPTQ:
             elif d_model_dim_index in [1, 2]: # Attention Output case
                 heads, head_dim, out_features = shape
                 self.rows, self.columns = heads * head_dim, out_features
-            else:
-                raise TypeError(f"Unsupported EinsumDense shape: {shape}")
             
             # Create a temporary object that holds a reshaped 2D version of the kernel.
             self.layer = type('temp', (object,), {
                 'kernel': ops.reshape(layer.kernel, (self.rows, self.columns)),
                 'bias': layer.bias
             })()
-        
+
         else:
             # Raise an error if the layer is not supported.
-            raise TypeError(f"Unsupported layer type for GPTQ: {type(layer)}")
+            raise TypeError(f"Unsupported layer type or kernel shape for GPTQ: {type(layer)} with kernel ndim {layer.kernel.ndim}")
 
         print("Hessian Matrix is: ", self.rows, self.rows)
         # Initialize the Hessian matrix after `self.rows` is correctly set for all cases.
