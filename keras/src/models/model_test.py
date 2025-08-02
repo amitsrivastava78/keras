@@ -1526,7 +1526,61 @@ class ModelQuantizationTest(testing.TestCase):
         perplexity = calculate_perplexity(model, test_dataloader)
         self.assertLess(perplexity, 200, "Perplexity should be low for a pre-trained model on real data.")
 
+    @pytest.mark.slow
+    def test_quantize_gptq_with_bloom(self):
+        import keras_hub
+        from datasets import load_dataset
+        
+        # Skip this test if authentication is required but not available
+        try:
+            model = keras_hub.models.BloomCausalLM.from_preset("bloom_1.1b_multi")
+        except ValueError as e:
+            if "403 Client Error" in str(e) or "consent" in str(e).lower():
+                pytest.skip("Skipping test due to authentication/consent requirements")
+            raise
 
+        test_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
+        # Prepare the data for the perplexity function
+        # This joins the text and tokenizes it, similar to your get_dataloader function
+        all_text = "\n\n".join(d['text'] for d in test_data if d['text'])
+        all_tokens = model.preprocessor.tokenizer.tokenize(all_text)
+
+        # Create a few samples from the real test data
+        test_samples = []
+        seq_len = 128
+        for i in range(50): # Use 50 samples for a stable PPL score
+            start = i * seq_len
+            end = start + seq_len
+            test_samples.append(np.reshape(all_tokens[start:end], (1, seq_len)))
+
+        test_dataloader = np.array(test_samples, dtype=np.int32)
+        long_text = """auto-gptq is an easy-to-use model quantization library with user-friendly apis, based on GPTQ algorithm.
+        The goal is to quantize pre-trained models to 4-bit or even 3-bit precision with minimal performance degradation.
+        This allows for running larger models on less powerful hardware, reducing memory footprint and increasing inference speed.
+        The process involves calibrating the model on a small dataset to determine the quantization parameters.
+        This technique is particularly useful for deploying large language models in resource-constrained environments where every bit of memory and every millisecond of latency counts."""
+        dataset = [long_text]
+        # 2. Create the GPTQ configuration.
+        gptq_config = GPTQConfig(
+            dataset="wikitext2",
+            # dataset=dataset,
+            tokenizer=model.preprocessor.tokenizer,
+            wbits=4,
+            nsamples=128,
+            seqlen=128,
+            groupsize=128,
+        )
+
+        # 3. Run the actual quantization process by calling the config object directly.
+        # This is the correct way to apply the logic to a third-party model object.
+        # quantized_model = gptq_config.quantize(model)
+        model.quantize("gptq", quant_config=gptq_config)
+
+        test_dataloader = np.array(test_samples, dtype=np.int32)
+        perplexity = calculate_perplexity(model, test_dataloader)
+        self.assertLess(perplexity, 200, "Perplexity should be low for a pre-trained model on real data.")
+        
     @pytest.mark.slow
     def test_quantize_gptq_with_einsumdense_attention(self):
         from datasets import load_dataset
