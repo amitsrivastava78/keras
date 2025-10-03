@@ -23,6 +23,25 @@ SUPPORTS_RAGGED_TENSORS = False
 IS_THREAD_SAFE = True
 
 
+def _is_jax_tracer(x):
+    """Check if x is a JAX tracer without triggering concretization errors."""
+    if not isinstance(x, jax.Array):
+        return False
+    for c in x.__class__.__mro__:
+        if c.__name__ == "Tracer" and c.__module__.startswith("jax"):
+            return True
+    return False
+
+
+def _safe_has_addressable_shards(x):
+    """Safely check if x has addressable_shards without tracer errors."""
+    return (
+        isinstance(x, jax.Array)
+        and not _is_jax_tracer(x)
+        and hasattr(x, "addressable_shards")
+    )
+
+
 class _ProtectedShardedArray:
     """Wrapper that prevents deletion of sharded JAX arrays.
 
@@ -32,7 +51,7 @@ class _ProtectedShardedArray:
 
     def __init__(self, array):
         self._array = array
-        self._is_sharded = hasattr(array, "addressable_shards")
+        self._is_sharded = _safe_has_addressable_shards(array)
 
     def __getattr__(self, name):
         # Delegate all attribute access to the wrapped array
@@ -62,13 +81,7 @@ class JaxVariable(KerasVariable):
         """Create a strong ref to a JAX array to prevent GC."""
         if isinstance(value, jax.Array):
             # Check if this is a JAX tracer (during compilation/tracing)
-            is_tracer = False
-            for c in value.__class__.__mro__:
-                if c.__name__ == "Tracer" and c.__module__.startswith("jax"):
-                    is_tracer = True
-                    break
-
-            if is_tracer:
+            if _is_jax_tracer(value):
                 # During tracing, we can't access addressable_shards
                 # Just hold a reference to the tracer itself
                 self._strong_reference = value
@@ -166,8 +179,8 @@ class JaxVariable(KerasVariable):
             logging.debug("_initialize: Tensor distributed across devices")
 
             # Log sharding info
-            if hasattr(value, "sharding") and hasattr(
-                value, "addressable_shards"
+            if hasattr(value, "sharding") and _safe_has_addressable_shards(
+                value
             ):
                 shards = value.addressable_shards
                 num_devices = len(shards)
@@ -205,7 +218,7 @@ class JaxVariable(KerasVariable):
             object.__setattr__(self, "raw_value", value)
         else:
             # Regular JAX variable - protect sharded arrays from deletion
-            if hasattr(value, "addressable_shards"):
+            if _safe_has_addressable_shards(value):
                 self._value = _ProtectedShardedArray(value)
             else:
                 self._value = value
@@ -234,8 +247,8 @@ class JaxVariable(KerasVariable):
             logging.debug("_direct_assign: Value distributed successfully")
 
             # Log sharding details
-            if hasattr(value, "sharding") and hasattr(
-                value, "addressable_shards"
+            if hasattr(value, "sharding") and _safe_has_addressable_shards(
+                value
             ):
                 shards = value.addressable_shards
                 num_devices = len(shards)
@@ -248,7 +261,7 @@ class JaxVariable(KerasVariable):
         self._maybe_create_strong_reference(value)
 
         # Assign the value - protect sharded arrays from deletion
-        if hasattr(value, "addressable_shards"):
+        if _safe_has_addressable_shards(value):
             self._value = _ProtectedShardedArray(value)
         else:
             self._value = value
