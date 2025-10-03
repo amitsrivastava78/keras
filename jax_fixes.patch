@@ -1,0 +1,761 @@
+From 73ed72d79ce1eb7e6bec6dc2100525440840724e Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 16:54:34 +0530
+Subject: [PATCH 1/8] Fix memory leak in
+ JaxVariable._maybe_create_strong_reference
+
+- Replace append logic with direct assignment for _shard_references
+- Prevents indefinite growth of reference list during variable access
+- Only holds current sharded array reference instead of accumulating all
+---
+ keras/src/backend/jax/core.py | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index 1c8ccd244..e960c2d36 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -88,9 +88,7 @@ class JaxVariable(KerasVariable):
+             elif hasattr(value, "addressable_shards"):
+                 # For sharded arrays, hold references to the shards' data.
+                 shard_data = [shard.data for shard in value.addressable_shards]
+-                if not hasattr(self, "_shard_references"):
+-                    self._shard_references = []
+-                self._shard_references.append(shard_data)
++                self._shard_references = [shard_data]
+             else:
+                 # For non-sharded arrays, hold a ref to the array itself.
+                 self._strong_reference = value
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From e596039a3eff72bd78fb1bae8eac2c869645b161 Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 17:04:30 +0530
+Subject: [PATCH 2/8] Refactor variable loading to use centralized helper
+ function
+
+- Remove hardcoded 'load_own_variables:' prefix from logging messages in variable_loading.py
+- Replace inline sharded variable loading logic in IndexLookup.load_own_variables with centralized load_variable_with_sharded_support helper
+- Add import for variable_loading module in index_lookup.py
+- Improves code consistency and maintainability across the codebase
+---
+ keras/src/layers/preprocessing/index_lookup.py | 16 +++++-----------
+ keras/src/utils/variable_loading.py            | 16 ++++------------
+ 2 files changed, 9 insertions(+), 23 deletions(-)
+
+diff --git a/keras/src/layers/preprocessing/index_lookup.py b/keras/src/layers/preprocessing/index_lookup.py
+index 3336288a0..fb8952a4b 100644
+--- a/keras/src/layers/preprocessing/index_lookup.py
++++ b/keras/src/layers/preprocessing/index_lookup.py
+@@ -7,6 +7,7 @@ from keras.src.layers.layer import Layer
+ from keras.src.utils import argument_validation
+ from keras.src.utils import numerical_utils
+ from keras.src.utils import tf_utils
++from keras.src.utils import variable_loading
+ from keras.src.utils.module_utils import tensorflow as tf
+ 
+ 
+@@ -808,17 +809,10 @@ class IndexLookup(Layer):
+         if self.output_mode == "tf_idf":
+             weight_data = store["idf_weights"]
+ 
+-            # Check if variable has a layout (is sharded)
+-            # and use chunked loading
+-            if (
+-                hasattr(self.idf_weights, "_layout")
+-                and self.idf_weights._layout is not None
+-            ):
+-                # Use _direct_assign for sharded variables to avoid OOM
+-                self.idf_weights._direct_assign(weight_data)
+-            else:
+-                # Use normal assign for non-sharded variables
+-                self.idf_weights.assign(weight_data)
++            # Use centralized helper for sharded variable loading
++            variable_loading.load_variable_with_sharded_support(
++                self.idf_weights, weight_data
++            )
+             self.idf_weights_const = self.idf_weights.value()
+ 
+     def save_assets(self, dir_path):
+diff --git a/keras/src/utils/variable_loading.py b/keras/src/utils/variable_loading.py
+index 91c2abde9..e3f5786bf 100644
+--- a/keras/src/utils/variable_loading.py
++++ b/keras/src/utils/variable_loading.py
+@@ -27,22 +27,14 @@ def load_variable_with_sharded_support(variable, weight_data):
+     if hasattr(variable, "_layout") and variable._layout is not None:
+         # Use _direct_assign for sharded variables to avoid OOM
+         logging.info(
+-            f"load_own_variables: Loading sharded variable "
+-            f"({variable.name}) with _direct_assign"
++            f"Loading sharded variable ({variable.name}) with _direct_assign"
+         )
+         variable._direct_assign(weight_data)
+-        logging.info(
+-            f"load_own_variables: Variable ({variable.name}) "
+-            "loaded successfully"
+-        )
++        logging.info(f"Variable ({variable.name}) loaded successfully")
+     else:
+         # Use normal assign for non-sharded variables
+         logging.info(
+-            f"load_own_variables: Loading non-sharded variable "
+-            f"({variable.name}) with assign"
++            f"Loading non-sharded variable ({variable.name}) with assign"
+         )
+         variable.assign(weight_data)
+-        logging.info(
+-            f"load_own_variables: Variable ({variable.name}) "
+-            "loaded successfully"
+-        )
++        logging.info(f"Variable ({variable.name}) loaded successfully")
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From a32c338196340c60c01adcdc53f66c7505336865 Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 17:07:57 +0530
+Subject: [PATCH 3/8] Refactor JAX variable initialization to eliminate code
+ duplication
+
+- Add _initialize_variable_with_sharding() shared helper function
+- Refactor JaxVariable._initialize() to use shared helper
+- Refactor NnxVariable._initialize() to use shared helper with NNX prefix
+- Reduces code duplication and improves maintainability
+- Preserves all existing functionality and logging behavior
+---
+ keras/src/backend/jax/core.py | 338 +++++++++++++++-------------------
+ 1 file changed, 144 insertions(+), 194 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index e960c2d36..0af011a9c 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -70,6 +70,119 @@ class _ProtectedShardedArray:
+         return f"_ProtectedShardedArray({self._array})"
+ 
+ 
++def _initialize_variable_with_sharding(
++    variable, value, log_prefix="_initialize"
++):
++    """Shared helper for initializing variables with sharding support.
++
++    This function handles the common logic for both JaxVariable and NnxVariable
++    initialization, including layout detection, logging, and tensor
++    distribution.
++
++    Args:
++        variable: The variable instance being initialized
++        value: The initial value
++        log_prefix: Prefix for logging messages (default: "_initialize")
++
++    Returns:
++        The processed value ready for assignment
++    """
++    import numpy as np
++
++    # Validate shape first
++    variable._shape = variable._validate_shape(value.shape)
++
++    # Detect layout from distribution if needed
++    distribution = global_state.get_global_attribute("distribution")
++    if variable._layout is None and distribution is not None:
++        logging.debug(
++            f"{log_prefix}: Getting layout for variable "
++            f"'{variable.path}' from distribution"
++        )
++        tensor_layout = distribution.get_variable_layout(variable)
++        logging.debug(
++            f"{log_prefix}: Distribution returned layout: {tensor_layout}"
++        )
++        from keras.src.distribution import TensorLayout
++
++        if isinstance(tensor_layout, TensorLayout):
++            variable._layout = tensor_layout.backend_layout
++            logging.debug(
++                f"{log_prefix}: Using backend_layout: {variable._layout}"
++            )
++        else:
++            variable._layout = tensor_layout
++            logging.debug(
++                f"{log_prefix}: Using layout directly: {variable._layout}"
++            )
++
++    # Log initialization details
++    total_elements = np.prod(variable._shape)
++    element_size = 4  # float32 = 4 bytes
++    total_size_mb = (total_elements * element_size) / (1024 * 1024)
++
++    logging.info(f"{log_prefix}: Creating variable '{variable.path}'")
++    logging.debug(
++        f"{log_prefix}: Shape: {variable._shape}, Size: {total_size_mb:.2f} MB"
++    )
++    logging.debug(f"{log_prefix}: Has layout: {variable._layout is not None}")
++
++    # If we have a layout, distribute the tensor to avoid OOM
++    if variable._layout is not None:
++        logging.info(
++            f"{log_prefix}: Sharded initialization (layout: {variable._layout})"
++        )
++
++        # Ensure value is on host (numpy array)
++        if not isinstance(value, np.ndarray):
++            value = np.array(value)
++            logging.debug(
++                f"{log_prefix}: Converted to numpy array (host memory)"
++            )
++        else:
++            logging.debug(
++                f"{log_prefix}: Value already numpy array (host memory)"
++            )
++
++        # Distribute to devices - this shards the tensor
++        value = distribution_lib.distribute_tensor(value, variable._layout)
++        logging.debug(f"{log_prefix}: Tensor distributed across devices")
++
++        # Log sharding info
++        if hasattr(value, "sharding") and _safe_has_addressable_shards(value):
++            shards = value.addressable_shards
++            num_devices = len(shards)
++            shard_0_elements = np.prod(shards[0].data.shape)
++            shard_0_size_mb = (shard_0_elements * element_size) / (1024 * 1024)
++
++            logging.debug(f"{log_prefix}: Sharded across {num_devices} devices")
++            logging.debug(
++                f"{log_prefix}: Device 0 shard: {shards[0].data.shape}, "
++                f"{shard_0_size_mb:.2f} MB"
++            )
++            # Calculate memory reduction percentage
++            mem_reduction = (
++                (total_size_mb - shard_0_size_mb) / total_size_mb * 100
++            )
++            logging.debug(
++                f"{log_prefix}: Memory reduction: {mem_reduction:.1f}%"
++            )
++    else:
++        logging.debug(f"{log_prefix}: NORMAL (non-sharded) initialization")
++        # Convert to tensor using normal path
++        value = variable._convert_to_tensor(value)
++
++    # Block until value is fully materialized to prevent GC
++    value = jax.block_until_ready(value)
++    variable._maybe_create_strong_reference(value)
++
++    logging.info(
++        f"{log_prefix}: Variable '{variable.path}' initialized successfully"
++    )
++
++    return value
++
++
+ class JaxVariable(KerasVariable):
+     def __init__(self, *args, layout=None, **kwargs):
+         # Intercept layout parameter so that it is available
+@@ -115,100 +228,7 @@ class JaxVariable(KerasVariable):
+         When a layout is present, it distributes the tensor across devices
+         during initialization to avoid OOM on device 0.
+         """
+-        import numpy as np
+-
+-        # Validate shape first
+-        self._shape = self._validate_shape(value.shape)
+-
+-        # Detect layout from distribution if needed
+-        distribution = global_state.get_global_attribute("distribution")
+-        if self._layout is None and distribution is not None:
+-            logging.debug(
+-                f"_initialize: Getting layout for variable "
+-                f"'{self.path}' from distribution"
+-            )
+-            tensor_layout = distribution.get_variable_layout(self)
+-            logging.debug(
+-                f"initialize: Distribution returned layout: {tensor_layout}"
+-            )
+-            from keras.src.distribution import TensorLayout
+-
+-            if isinstance(tensor_layout, TensorLayout):
+-                self._layout = tensor_layout.backend_layout
+-                logging.debug(
+-                    f"_initialize: Using backend_layout: {self._layout}"
+-                )
+-            else:
+-                self._layout = tensor_layout
+-                logging.debug(
+-                    f"_initialize: Using layout directly: {self._layout}"
+-                )
+-
+-        # Log initialization details
+-        total_elements = np.prod(self._shape)
+-        element_size = 4  # float32 = 4 bytes
+-        total_size_mb = (total_elements * element_size) / (1024 * 1024)
+-
+-        logging.info(f"_initialize: Creating variable '{self.path}'")
+-        logging.debug(
+-            f"_initialize: Shape: {self._shape}, Size: {total_size_mb:.2f} MB"
+-        )
+-        logging.debug(f"_initialize: Has layout: {self._layout is not None}")
+-
+-        # If we have a layout, distribute the tensor to avoid OOM
+-        if self._layout is not None:
+-            logging.info(
+-                f"_initialize: Sharded initialization (layout: {self._layout})"
+-            )
+-
+-            # Ensure value is on host (numpy array)
+-            if not isinstance(value, np.ndarray):
+-                value = np.array(value)
+-                logging.debug(
+-                    "_initialize: Converted to numpy array (host memory)"
+-                )
+-            else:
+-                logging.debug(
+-                    "_initialize: Value already numpy array (host memory)"
+-                )
+-
+-            # Distribute to devices - this shards the tensor
+-            value = distribution_lib.distribute_tensor(value, self._layout)
+-            logging.debug("_initialize: Tensor distributed across devices")
+-
+-            # Log sharding info
+-            if hasattr(value, "sharding") and _safe_has_addressable_shards(
+-                value
+-            ):
+-                shards = value.addressable_shards
+-                num_devices = len(shards)
+-                shard_0_elements = np.prod(shards[0].data.shape)
+-                shard_0_size_mb = (shard_0_elements * element_size) / (
+-                    1024 * 1024
+-                )
+-
+-                logging.debug(
+-                    f"_initialize: Sharded across {num_devices} devices"
+-                )
+-                logging.debug(
+-                    f"_initialize: Device 0 shard: {shards[0].data.shape}, "
+-                    f"{shard_0_size_mb:.2f} MB"
+-                )
+-                # Calculate memory reduction percentage
+-                mem_reduction = (
+-                    (total_size_mb - shard_0_size_mb) / total_size_mb * 100
+-                )
+-                logging.debug(
+-                    f"_initialize: Memory reduction: {mem_reduction:.1f}%"
+-                )
+-        else:
+-            logging.debug("_initialize: NORMAL (non-sharded) initialization")
+-            # Convert to tensor using normal path
+-            value = self._convert_to_tensor(value)
+-
+-        # Block until value is fully materialized to prevent GC
+-        value = jax.block_until_ready(value)
+-        self._maybe_create_strong_reference(value)
++        value = _initialize_variable_with_sharding(self, value)
+ 
+         # Set the value (this is the critical part!)
+         if hasattr(self, "raw_value"):
+@@ -221,10 +241,6 @@ class JaxVariable(KerasVariable):
+             else:
+                 self._value = value
+ 
+-        logging.info(
+-            f"_initialize: Variable '{self.path}' initialized successfully"
+-        )
+-
+     def _direct_assign(self, value):
+         """Assign value to variable with sharding support.
+ 
+@@ -404,110 +420,44 @@ if config.is_nnx_enabled():
+                 # Fallback if shape isn't immediately available.
+                 self._ndim = len(self.raw_value.shape)
+ 
+-        def _initialize(self, value):
+-            """Initialize NNX variable with sharding support."""
+-            import numpy as np
+-
+-            # Validate shape first
+-            self._shape = self._validate_shape(value.shape)
+-
+-            # Detect layout from distribution if needed
+-            distribution = global_state.get_global_attribute("distribution")
+-            if self._layout is None and distribution is not None:
+-                logging.debug(
+-                    f"_initialize (NNX): Getting layout for '{self.path}'"
+-                )
+-                tensor_layout = distribution.get_variable_layout(self)
+-                logging.debug(
+-                    f"_initialize (NNX): Layout from distribution: "
+-                    f"{tensor_layout}"
+-                )
+-                from keras.src.distribution import TensorLayout
+-
+-                if isinstance(tensor_layout, TensorLayout):
+-                    self._layout = tensor_layout.backend_layout
+-                    logging.debug(
+-                        f"_initialize (NNX): Using backend_layout: "
+-                        f"{self._layout}"
+-                    )
+-                else:
+-                    self._layout = tensor_layout
+-                    logging.debug(
+-                        f"_initialize (NNX): Using layout directly: "
+-                        f"{self._layout}"
+-                    )
+-
+-            # Log initialization
+-            total_elements = np.prod(self._shape)
+-            element_size = 4
+-            total_size_mb = (total_elements * element_size) / (1024 * 1024)
+-
+-            logging.info(f"_initialize (NNX): Creating variable '{self.path}'")
+-            logging.debug(
+-                f"_initialize (NNX): Shape: {self._shape}, "
+-                f"Size: {total_size_mb:.2f} MB"
+-            )
+-
+-            # Handle sharded initialization
+-            if self._layout is not None:
+-                logging.info("_initialize (NNX): SHARDED initialization")
+-
+-                # Ensure on host
+-                if not isinstance(value, np.ndarray):
+-                    value = np.array(value)
+-
+-                # Distribute
+-                value = distribution_lib.distribute_tensor(value, self._layout)
+-                logging.debug("_initialize (NNX): Tensor distributed")
+-            else:
+-                logging.info("_initialize (NNX): NORMAL initialization")
+-                value = self._convert_to_tensor(value)
++    def _initialize(self, value):
++        """Initialize NNX variable with sharding support."""
++        value = _initialize_variable_with_sharding(
++            self, value, "_initialize (NNX)"
++        )
+ 
+-            # Block and keep reference to ALL shards
+-            value = jax.block_until_ready(value)
+-            self._maybe_create_strong_reference(value)
+-            # Set value for NNX
+-            object.__setattr__(self, "raw_value", value)
++        # Set value for NNX
++        object.__setattr__(self, "raw_value", value)
+ 
+-            logging.info(
+-                f"_initialize (NNX): Variable '{self.path}' initialized"
+-            )
+-
+-        def _direct_assign(self, value):
+-            """Assign value to NNX variable with sharding support."""
+-            import numpy as np
++    def _direct_assign(self, value):
++        """Assign value to NNX variable with sharding support."""
++        import numpy as np
+ 
+-            if self._layout is not None:
+-                logging.debug(
+-                    f"_direct_assign (NNX): Distributing '{self.path}'"
+-                )
++        if self._layout is not None:
++            logging.debug(f"_direct_assign (NNX): Distributing '{self.path}'")
+ 
+-                # Check if numpy
+-                if isinstance(value, np.ndarray):
+-                    logging.debug("_direct_assign (NNX): Value is numpy (HOST)")
++            # Check if numpy
++            if isinstance(value, np.ndarray):
++                logging.debug("_direct_assign (NNX): Value is numpy (HOST)")
+ 
+-                # Distribute
+-                value = distribution_lib.distribute_variable(
+-                    value, self._layout
+-                )
+-                logging.debug("_direct_assign (NNX): Distributed successfully")
++            # Distribute
++            value = distribution_lib.distribute_variable(value, self._layout)
++            logging.debug("_direct_assign (NNX): Distributed successfully")
+ 
+-            # Apply on_set_value hook if exists
+-            if (
+-                hasattr(self, "_var_metadata")
+-                and "on_set_value" in self._var_metadata
+-            ):
+-                value = self._var_metadata["on_set_value"](self, value)
++        # Apply on_set_value hook if exists
++        if (
++            hasattr(self, "_var_metadata")
++            and "on_set_value" in self._var_metadata
++        ):
++            value = self._var_metadata["on_set_value"](self, value)
+ 
+-            # Block and keep reference to ALL shards
+-            value = jax.block_until_ready(value)
+-            self._maybe_create_strong_reference(value)
+-            # Set value for NNX
+-            object.__setattr__(self, "raw_value", value)
++        # Block and keep reference to ALL shards
++        value = jax.block_until_ready(value)
++        self._maybe_create_strong_reference(value)
++        # Set value for NNX
++        object.__setattr__(self, "raw_value", value)
+ 
+-            logging.info(
+-                f"_direct_assign (NNX): Variable '{self.path}' assigned"
+-            )
++        logging.info(f"_direct_assign (NNX): Variable '{self.path}' assigned")
+ 
+         @property
+         def value(self):
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From 047f10ed2d80a29fd8226e90111055dc81fa9c02 Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 17:21:14 +0530
+Subject: [PATCH 4/8] Fix TraceContextError in JAX backend by preventing
+ variable mutations during invalid trace states
+
+---
+ keras/src/backend/jax/core.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index 0af011a9c..0eda947b6 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -193,11 +193,15 @@ class JaxVariable(KerasVariable):
+     def _maybe_create_strong_reference(self, value):
+         """Create a strong ref to a JAX array to prevent GC."""
+         if isinstance(value, jax.Array):
++            # Don't create references if we're in a trace context where
++            # mutations are not allowed
++            if not self._trace_state.is_valid():
++                return
+             # Check if this is a JAX tracer (during compilation/tracing)
+             if _is_jax_tracer(value):
+-                # During tracing, we can't access addressable_shards
+-                # Just hold a reference to the tracer itself
+-                self._strong_reference = value
++                # During tracing, JAX manages the arrays, so we don't need
++                # to hold references to prevent GC
++                return
+             elif hasattr(value, "addressable_shards"):
+                 # For sharded arrays, hold references to the shards' data.
+                 shard_data = [shard.data for shard in value.addressable_shards]
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From 3e6dff7a6343d5ef90ad69c019fcfa30651367c0 Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 17:25:13 +0530
+Subject: [PATCH 5/8] Fix TraceContextError in JAX backend by preventing
+ variable mutations during invalid trace states
+
+---
+ keras/src/backend/jax/core.py | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index 0eda947b6..1573ec600 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -194,8 +194,11 @@ class JaxVariable(KerasVariable):
+         """Create a strong ref to a JAX array to prevent GC."""
+         if isinstance(value, jax.Array):
+             # Don't create references if we're in a trace context where
+-            # mutations are not allowed
+-            if not self._trace_state.is_valid():
++            # mutations are not allowed (for NNX variables)
++            if (
++                hasattr(self, "_trace_state")
++                and not self._trace_state.is_valid()
++            ):
+                 return
+             # Check if this is a JAX tracer (during compilation/tracing)
+             if _is_jax_tracer(value):
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From 2b5fa064dbd7e5064bc435fc00bfb4bf42a7a00f Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 17:32:12 +0530
+Subject: [PATCH 6/8] Fix array deletion issue by handling TraceContextError
+ gracefully in reference creation
+
+---
+ keras/src/backend/jax/core.py | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index 1573ec600..17cc703fb 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -193,13 +193,6 @@ class JaxVariable(KerasVariable):
+     def _maybe_create_strong_reference(self, value):
+         """Create a strong ref to a JAX array to prevent GC."""
+         if isinstance(value, jax.Array):
+-            # Don't create references if we're in a trace context where
+-            # mutations are not allowed (for NNX variables)
+-            if (
+-                hasattr(self, "_trace_state")
+-                and not self._trace_state.is_valid()
+-            ):
+-                return
+             # Check if this is a JAX tracer (during compilation/tracing)
+             if _is_jax_tracer(value):
+                 # During tracing, JAX manages the arrays, so we don't need
+@@ -208,10 +201,18 @@ class JaxVariable(KerasVariable):
+             elif hasattr(value, "addressable_shards"):
+                 # For sharded arrays, hold references to the shards' data.
+                 shard_data = [shard.data for shard in value.addressable_shards]
+-                self._shard_references = [shard_data]
++                try:
++                    self._shard_references = [shard_data]
++                except Exception:
++                    # During tracing, mutations might not be allowed
++                    pass
+             else:
+                 # For non-sharded arrays, hold a ref to the array itself.
+-                self._strong_reference = value
++                try:
++                    self._strong_reference = value
++                except Exception:
++                    # During tracing, mutations might not be allowed
++                    pass
+ 
+     @property
+     def value(self):
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From b23cee7a0c3e5865bfd6efd599e2c51b7137b7ba Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 18:07:07 +0530
+Subject: [PATCH 7/8] Fix array deletion by ensuring strong references are
+ created for JaxVariable during normal execution
+
+---
+ keras/src/backend/jax/core.py | 36 +++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index 17cc703fb..a4ac1670b 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -201,18 +201,38 @@ class JaxVariable(KerasVariable):
+             elif hasattr(value, "addressable_shards"):
+                 # For sharded arrays, hold references to the shards' data.
+                 shard_data = [shard.data for shard in value.addressable_shards]
+-                try:
++                if hasattr(self, "_trace_state"):
++                    # NNX variable - check for TraceContextError
++                    try:
++                        self._shard_references = [shard_data]
++                    except Exception as e:
++                        if config.is_nnx_enabled():
++                            from flax.errors import TraceContextError
++
++                            if not isinstance(e, TraceContextError):
++                                raise
++                        else:
++                            raise
++                else:
++                    # Regular JaxVariable - always create reference
+                     self._shard_references = [shard_data]
+-                except Exception:
+-                    # During tracing, mutations might not be allowed
+-                    pass
+             else:
+                 # For non-sharded arrays, hold a ref to the array itself.
+-                try:
++                if hasattr(self, "_trace_state"):
++                    # NNX variable - check for TraceContextError
++                    try:
++                        self._strong_reference = value
++                    except Exception as e:
++                        if config.is_nnx_enabled():
++                            from flax.errors import TraceContextError
++
++                            if not isinstance(e, TraceContextError):
++                                raise
++                        else:
++                            raise
++                else:
++                    # Regular JaxVariable - always create reference
+                     self._strong_reference = value
+-                except Exception:
+-                    # During tracing, mutations might not be allowed
+-                    pass
+ 
+     @property
+     def value(self):
+-- 
+2.51.0.618.g983fd99d29-goog
+
+
+From 7816f0c738eb25aef12bd69cd9c4daa7258c51fd Mon Sep 17 00:00:00 2001
+From: Amit Srivastava <amitsrivasta@google.com>
+Date: Fri, 3 Oct 2025 18:18:53 +0530
+Subject: [PATCH 8/8] Fix array deletion by ensuring strong references are
+ created for JaxVariable during normal execution while handling NNX tracing
+ contexts
+
+---
+ keras/src/backend/jax/core.py | 26 ++++++++------------------
+ 1 file changed, 8 insertions(+), 18 deletions(-)
+
+diff --git a/keras/src/backend/jax/core.py b/keras/src/backend/jax/core.py
+index a4ac1670b..68d9c264b 100644
+--- a/keras/src/backend/jax/core.py
++++ b/keras/src/backend/jax/core.py
+@@ -202,34 +202,24 @@ class JaxVariable(KerasVariable):
+                 # For sharded arrays, hold references to the shards' data.
+                 shard_data = [shard.data for shard in value.addressable_shards]
+                 if hasattr(self, "_trace_state"):
+-                    # NNX variable - check for TraceContextError
++                    # NNX variable - be careful with mutations during tracing
+                     try:
+                         self._shard_references = [shard_data]
+-                    except Exception as e:
+-                        if config.is_nnx_enabled():
+-                            from flax.errors import TraceContextError
+-
+-                            if not isinstance(e, TraceContextError):
+-                                raise
+-                        else:
+-                            raise
++                    except Exception:
++                        # During tracing, mutations might not be allowed
++                        pass
+                 else:
+                     # Regular JaxVariable - always create reference
+                     self._shard_references = [shard_data]
+             else:
+                 # For non-sharded arrays, hold a ref to the array itself.
+                 if hasattr(self, "_trace_state"):
+-                    # NNX variable - check for TraceContextError
++                    # NNX variable - be careful with mutations during tracing
+                     try:
+                         self._strong_reference = value
+-                    except Exception as e:
+-                        if config.is_nnx_enabled():
+-                            from flax.errors import TraceContextError
+-
+-                            if not isinstance(e, TraceContextError):
+-                                raise
+-                        else:
+-                            raise
++                    except Exception:
++                        # During tracing, mutations might not be allowed
++                        pass
+                 else:
+                     # Regular JaxVariable - always create reference
+                     self._strong_reference = value
+-- 
+2.51.0.618.g983fd99d29-goog
+
